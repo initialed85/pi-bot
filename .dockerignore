@@ -1,0 +1,10 @@
+# The image builds one Go binary. Everything here is either build context bloat or a secret that must
+# never reach a registry.
+.git/
+.pi/
+___secret/
+node_modules/
+/tmp/
+*.key.json
+/spike/bin/
+*.jsonl

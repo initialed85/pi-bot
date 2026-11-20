@@ -1,0 +1,24 @@
+# Gate for both halves of the bot. The bridge is Go; the gateway is a Pi extension in TypeScript that
+# runs inside a live session, so its lane is a syntax/type-strip check rather than a unit run - the
+# behaviour it implements (queued vs steered prompts, answers posted once) is pinned by the Go tests in
+# internal/bridge, which drive a fake gateway through the same protocol.
+steps:
+  - name: test-bridge
+    image: docker.io/library/golang:1.27-alpine
+    commands:
+      - go version
+      - gofmt -l .
+      - test -z "$(gofmt -l .)"
+      - go vet ./...
+      - go test -count=1 ./...
+
+  - name: check-gateway
+    image: docker.io/library/node:22-alpine
+    commands:
+      - node --version
+      - npm run check
+
+when:
+  - event: push
+    branch: master
+  - event: pull_request

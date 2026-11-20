@@ -1,0 +1,8 @@
+/bin/
+/spike/bin/
+*.key.json
+___secret/
+/.pi/
+spike/events.jsonl
+/tmp/
+/node_modules/

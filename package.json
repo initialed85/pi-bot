@@ -1,0 +1,27 @@
+{
+  "name": "pi-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Google Chat app that drives a live Pi session (bridge + gateway extension)",
+  "keywords": [
+    "pi-package"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "check": "node --experimental-strip-types --check gateway/index.ts",
+    "test": "node --experimental-strip-types --check gateway/index.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./gateway/index.ts"
+    ]
+  }
+}

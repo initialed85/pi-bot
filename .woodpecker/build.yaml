@@ -1,0 +1,34 @@
+# Publish the bridge image. Deployment manifests live in the environment repository, so this lane
+# only builds and publishes the image; rollout is managed separately.
+#
+# The privileged docker step needs this repo marked trusted in the Woodpecker UI (security trust), and it
+# reaches the daemon of one CI node so the layer cache survives between runs.
+steps:
+  - name: build-and-push
+    image: docker.io/library/docker:cli
+    privileged: true
+    environment:
+      DOCKER_HOST: tcp://docker-beefcake-ci-1:2375
+      IMAGE: docker.io/initialed85/pi-bot
+    backend_options:
+      kubernetes:
+        secrets:
+          - name: dockerhub
+            key: username
+            target:
+              env: DOCKERHUB_USER
+          - name: dockerhub
+            key: token
+            target:
+              env: DOCKERHUB_TOKEN
+    commands:
+      - docker info --format 'daemon={{.Name}} images_before={{.Images}}'
+      - echo "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USER" --password-stdin
+      - docker build --platform=linux/amd64 -t "$IMAGE:$CI_COMMIT_SHA" -t "$IMAGE:latest" .
+      - docker push "$IMAGE:$CI_COMMIT_SHA"
+      - docker push "$IMAGE:latest"
+      - docker image inspect --format 'digest={{.RepoDigests}}' "$IMAGE:$CI_COMMIT_SHA"
+
+when:
+  - event: push
+    branch: master
