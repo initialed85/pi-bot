@@ -49,9 +49,22 @@ const rows = decisions.map((d) => {
   // The prompt is a rendered multi-line string; the message is the line after
   // the "Latest message..." header, up to the next blank line.
   const lines = String(d.prompt ?? "").split("\n");
+  // should-respond renders `Latest message from <who>:`; thread-request renders
+  // `Message: "..."` (which can wrap over lines); summary uses the should-respond shape.
   const i = lines.findIndex((l) => /^Latest message/.test(l));
   let text = "";
-  if (i >= 0) text = lines.slice(i + 1).find((l) => l.trim() !== "") ?? "";
+  if (i >= 0) {
+    const body = [];
+    for (const l of lines.slice(i + 1)) { if (l.trim() === "") break; body.push(l.trim()); }
+    text = body.join(" ");
+  } else {
+    const m = lines.findIndex((l) => /^Message: "/.test(l));
+    if (m >= 0) {
+      const body = [];
+      for (const l of lines.slice(m)) { if (/^Answer with exactly/.test(l)) break; body.push(l.trim()); }
+      text = body.join(" ").replace(/^Message: "/, "").replace(/"$/, "");
+    }
+  }
   const s = lines.findIndex((l) => /^Thread summary:/.test(l));
   return {
     time: (d.time ?? "").slice(11, 19), thread: (d.thread ?? "").split("/").pop(),
@@ -59,6 +72,7 @@ const rows = decisions.map((d) => {
     message: text.trim().slice(0, 70),
     suppresses: WOULD_SUPPRESS.has(d.action),
     reroutes: /(^|-)thread$/.test(d.action ?? ""),
+    fallback: /(^|-)fallback-/.test(d.action ?? ""),
     summary: s >= 0 ? lines.slice(s + 1).find((l) => l.trim() !== "")?.trim().slice(0, 60) ?? "" : "",
   };
 });
@@ -89,5 +103,8 @@ if (rerouted.length) {
 }
 const answered = rows.filter((r) => !r.suppresses && !r.reroutes).length;
 console.log(`   (${answered} answered in place)`);
+const fb = rows.filter((r) => r.fallback);
+if (fb.length) console.log(`   ${fb.length} classifier FAILURE(S)/timeout(s) - the gate did not decide, the fallback did:\n` +
+  fb.map((r) => `     [${r.time}] ${r.flow} -> ${r.action} after ${r.ms}ms (enforce behaviour: ${r.action.includes("silent") ? "IGNORED THE MESSAGE" : "answered anyway"})`).join("\n"));
 const slow = rows.filter((r) => r.ms >= 1500);
 if (slow.length) console.log(`\n   ${slow.length} call(s) >=1500ms - approaching the 2s deadline (enforce would fall back on these)`);
