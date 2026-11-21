@@ -28,13 +28,14 @@ type posted struct {
 }
 
 type fakeChat struct {
-	mu        sync.Mutex
-	posts     []posted
-	patches   map[string]string
-	deletes   []string
-	downloads map[string][]byte
-	failPost  error
-	nextName  int
+	mu           sync.Mutex
+	posts        []posted
+	patches      map[string]string
+	deletes      []string
+	downloads    map[string][]byte
+	ownedThreads map[string]bool
+	failPost     error
+	nextName     int
 }
 
 func (f *fakeChat) Post(_ context.Context, text string, opts chatapi.PostOpts) (*chatapi.Message, error) {
@@ -135,6 +136,12 @@ func (f *fakeChat) DownloadMedia(_ context.Context, ref string, _ int64) ([]byte
 		return nil, "", fmt.Errorf("no such attachment %q", ref)
 	}
 	return data, "image/png", nil
+}
+
+func (f *fakeChat) HasBotMessage(_ context.Context, _, thread string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.ownedThreads[thread], nil
 }
 
 func (f *fakeChat) lastPost() (string, chatapi.PostOpts, bool) {
@@ -1274,18 +1281,21 @@ func TestGroupTopLevelGateIsHardAndTaggedThreadsRemainEligible(t *testing.T) {
 	}, errs: map[string]error{}}
 	b := New(&fakeChat{}, &fakeGateway{}, Config{ReplyGateMode: "dry-run", ReplyGate: gate, RequireMentionInRooms: false}, nil)
 	outside := gateEvent(false, false)
-	if b.groupMessageEligible(outside) {
+	outside.MessageName = "spaces/test/messages/top.top"
+	outside.Thread = "spaces/test/threads/top"
+	if b.groupMessageEligible(context.Background(), outside) {
 		t.Fatal("new group thread was pre-authorized")
 	}
 	// The hard top-level rule is checked before replyGate, so this path must not call the model.
-	if b.groupMessageEligible(outside) || len(gate.calls) != 0 {
+	if b.groupMessageEligible(context.Background(), outside) || len(gate.calls) != 0 {
 		t.Fatalf("untagged top-level message was not ignored: calls=%v", gate.calls)
 	}
 
 	tagged := gateEvent(false, true)
 	b.markPiThread(tagged.Thread)
 	followUp := gateEvent(false, false)
-	if !b.groupMessageEligible(followUp) {
+	followUp.MessageName = "spaces/test/messages/follow.thread-1"
+	if !b.groupMessageEligible(context.Background(), followUp) {
 		t.Fatal("tagged thread was not recorded")
 	}
 	if _, suppress := b.replyGate(context.Background(), followUp, followUp.Prompt()); suppress {
@@ -1293,5 +1303,21 @@ func TestGroupTopLevelGateIsHardAndTaggedThreadsRemainEligible(t *testing.T) {
 	}
 	if len(gate.callsFor(chatgate.FlowShouldRespond)) != 1 {
 		t.Fatalf("eligible thread did not reach should-respond: %+v", gate.calls)
+	}
+}
+
+func TestGroupThreadOwnershipSurvivesBridgeRestart(t *testing.T) {
+	thread := "spaces/test/threads/persisted"
+	chat := &fakeChat{ownedThreads: map[string]bool{thread: true}}
+	first := New(chat, &fakeGateway{}, Config{ReplyGateMode: "dry-run", ReplyGate: &fakeGate{answers: map[string]string{}, errs: map[string]error{}}, RequireMentionInRooms: false}, nil)
+	ev := gateEvent(false, false)
+	ev.Thread = thread
+	ev.MessageName = "spaces/test/messages/follow-up.persisted"
+	if !first.groupMessageEligible(context.Background(), ev) {
+		t.Fatal("first bridge did not recover ownership from Chat history")
+	}
+	second := New(chat, &fakeGateway{}, Config{ReplyGateMode: "dry-run", ReplyGate: &fakeGate{answers: map[string]string{}, errs: map[string]error{}}, RequireMentionInRooms: false}, nil)
+	if !second.groupMessageEligible(context.Background(), ev) {
+		t.Fatal("restarted bridge did not recover ownership from Chat history")
 	}
 }

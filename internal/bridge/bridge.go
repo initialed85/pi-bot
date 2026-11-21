@@ -36,6 +36,7 @@ type Chat interface {
 	Get(ctx context.Context, name string) (*chatapi.Message, error)
 	Delete(ctx context.Context, name string) error
 	DownloadMedia(ctx context.Context, resourceRef string, maxBytes int64) ([]byte, string, error)
+	HasBotMessage(ctx context.Context, space, thread string) (bool, error)
 }
 
 // Gateway is the slice of gateway.Client the bridge uses; faked in tests.
@@ -375,7 +376,7 @@ func (b *Bridge) onMessage(ctx context.Context, ev *chatmsg.Event) error {
 	if !ev.DM && ev.Mentioned {
 		b.markPiThread(ev.Thread)
 	}
-	if !b.groupMessageEligible(ev) {
+	if !b.groupMessageEligible(ctx, ev) {
 		b.log.Info("group message outside a pi-chat thread; ignoring", "space", ev.Space, "thread", ev.Thread)
 		return nil
 	}
@@ -493,8 +494,49 @@ func (b *Bridge) replyGate(ctx context.Context, ev *chatmsg.Event, message strin
 	return replyThread, false
 }
 
-func (b *Bridge) groupMessageEligible(ev *chatmsg.Event) bool {
-	return ev.DM || ev.Mentioned || b.isPiThread(ev.Thread)
+func (b *Bridge) groupMessageEligible(ctx context.Context, ev *chatmsg.Event) bool {
+	if ev.DM || ev.Mentioned {
+		return true
+	}
+	// Preserve the old no-gate behaviour byte-for-byte. The persisted ownership lookup is only
+	// active when reply gating is explicitly enabled.
+	if b.cfg.ReplyGateMode == "off" {
+		return !b.cfg.RequireMentionInRooms || ev.SpaceType == "DM"
+	}
+	// A new top-level message is never a continuation, even though Chat gives it a synthetic thread
+	// name. This keeps the hard no-model-call rule for group top-level chatter.
+	if isTopLevel(ev) {
+		return false
+	}
+	if b.isPiThread(ev.Thread) {
+		return true
+	}
+	owned, err := b.chat.HasBotMessage(ctx, ev.Space, ev.Thread)
+	if err != nil {
+		b.log.Warn("thread ownership lookup failed", "space", ev.Space, "thread", ev.Thread, "err", err)
+		return false
+	}
+	if owned {
+		b.markPiThread(ev.Thread)
+	}
+	return owned
+}
+
+func isTopLevel(ev *chatmsg.Event) bool {
+	if ev.Thread == "" || ev.Thread == ev.Space || ev.MessageName == "" {
+		return true
+	}
+	parts := strings.Split(ev.MessageName, "/")
+	if len(parts) == 0 {
+		return true
+	}
+	messageID := parts[len(parts)-1]
+	if dot := strings.IndexByte(messageID, '.'); dot >= 0 {
+		// Chat uses messageId.messageId for a top-level message and messageId.threadId for
+		// a reply. The thread resource itself is not enough to distinguish those cases.
+		return messageID[:dot] == messageID[dot+1:]
+	}
+	return true
 }
 
 func (b *Bridge) markPiThread(thread string) {

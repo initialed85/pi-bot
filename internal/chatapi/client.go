@@ -112,6 +112,25 @@ func (c *Client) Get(ctx context.Context, name string) (*Message, error) {
 	return &Message{Name: got.Name, Text: got.Text}, nil
 }
 
+// HasBotMessage checks Chat's durable history to recover thread ownership after a bridge restart.
+// The app-authored message is identified by sender type BOT; no local state volume is required.
+func (c *Client) HasBotMessage(ctx context.Context, space, thread string) (bool, error) {
+	if space == "" || thread == "" {
+		return false, nil
+	}
+	filter := "thread.name = " + thread
+	page, err := c.svc.Spaces.Messages.List(space).Filter(filter).PageSize(100).Context(ctx).Do()
+	if err != nil {
+		return false, fmt.Errorf("chatapi: list thread %s: %w", thread, err)
+	}
+	for _, message := range page.Messages {
+		if message != nil && message.Sender != nil && message.Sender.Type == "BOT" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // AttachmentMeta is what spaces.messages.attachments.get says about one attachment. The event
 // payload carries most of this already; the call exists to confirm the attachment is real and to
 // pick up fields the event sometimes omits.
