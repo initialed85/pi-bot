@@ -103,7 +103,9 @@ In `enforce` mode, direct messages can be routed inline or into a new thread, an
 inside a group thread can be suppressed. Classifier failures fall back to inline DMs and silence
 untagged group-thread messages. Do not enable `enforce` until dry-run logs have been reviewed.
 The prompts are embedded under `internal/chatgate/prompts/` and are intentionally kept identical to
-the evaluated prompts in the companion `pi-bot` package.
+the evaluated prompts in the companion `pi-bot` package. `go test ./...` fetches the upstream prompt
+files and fails on drift, forcing a re-vendor and fresh eval; set `PI_CHAT_GATE_PROMPT_DRIFT_WARN=1`
+only for an intentionally offline CI run.
 
 ## Layout
 

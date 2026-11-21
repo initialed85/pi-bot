@@ -446,6 +446,11 @@ func (b *Bridge) replyGate(ctx context.Context, ev *chatmsg.Event, message strin
 		}
 	}
 	answer, prompt, _, err := b.gate.Classify(ctx, flow, summary, ev.Who(), message)
+	if err == nil && flow != chatgate.FlowSummary {
+		if _, ok := exactGateToken(answer, flow); !ok {
+			err = fmt.Errorf("invalid %s classifier answer %q", flow, answer)
+		}
+	}
 	action := "dry-run-forward"
 	if err != nil {
 		if ev.DM {
@@ -508,6 +513,18 @@ func firstWord(value string) string {
 		return ""
 	}
 	return words[0]
+}
+
+func exactGateToken(answer, flow string) (string, bool) {
+	token := strings.ToUpper(strings.TrimSpace(answer))
+	switch flow {
+	case chatgate.FlowShouldRespond:
+		return token, token == "YES" || token == "NO"
+	case chatgate.FlowThreadRequest:
+		return token, token == "THREAD" || token == "INLINE"
+	default:
+		return token, false
+	}
 }
 
 // track registers a turn and starts the goroutine that turns it into Chat messages. base is the

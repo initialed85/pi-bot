@@ -1222,6 +1222,27 @@ func TestReplyGate_ThreadSuppressionStillUpdatesSummary(t *testing.T) {
 	}
 }
 
+func TestReplyGate_InvalidClassifierTokenFallsBack(t *testing.T) {
+	for _, test := range []struct {
+		dm           bool
+		wantSuppress bool
+	}{
+		{dm: true},
+		{dm: false, wantSuppress: true},
+	} {
+		gate := &fakeGate{answers: map[string]string{
+			chatgate.FlowThreadRequest: "THREAD because...",
+			chatgate.FlowShouldRespond: "NO because...",
+		}, errs: map[string]error{}}
+		b := New(&fakeChat{}, &fakeGateway{}, Config{ReplyGateMode: "enforce", ReplyGate: gate, RequireMentionInRooms: false}, nil)
+		got, suppress := b.replyGate(context.Background(), gateEvent(test.dm, false), "hello")
+		wantThread := "spaces/test/threads/thread-1"
+		if suppress != test.wantSuppress || got != wantThread {
+			t.Fatalf("dm=%v route=%q suppress=%v, want route=%q suppress=%v", test.dm, got, suppress, wantThread, test.wantSuppress)
+		}
+	}
+}
+
 func TestReplyGate_Fallbacks(t *testing.T) {
 	for _, test := range []struct {
 		name         string

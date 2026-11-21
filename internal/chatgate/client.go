@@ -23,6 +23,19 @@ const (
 //go:embed prompts/*.md
 var promptFiles embed.FS
 
+// VendoredPromptSource identifies the evaluated prompt revision copied into this binary.
+// Prompt text is owned by pi-bot; re-vendor after changing it there and re-run its eval.
+const VendoredPromptSource = "initialed85/pi-bot@404b884"
+
+// PromptText returns the exact source template shipped in the bridge.
+func PromptText(flow string) (string, error) {
+	data, err := promptFiles.ReadFile("prompts/" + flow + ".md")
+	if err != nil {
+		return "", fmt.Errorf("chatgate: unknown flow %q: %w", flow, err)
+	}
+	return string(data), nil
+}
+
 // Classifier is deliberately small so bridge tests can make every model decision deterministic.
 type Classifier interface {
 	Classify(ctx context.Context, flow string, summary, sender, message string) (answer string, prompt string, latency time.Duration, err error)
@@ -117,15 +130,15 @@ func prompt(flow, summary, sender, message string) (string, error) {
 	if name == "" {
 		return "", fmt.Errorf("chatgate: empty flow")
 	}
-	data, err := promptFiles.ReadFile("prompts/" + name + ".md")
+	template, err := PromptText(name)
 	if err != nil {
-		return "", fmt.Errorf("chatgate: unknown flow %q: %w", flow, err)
+		return "", err
 	}
 	return strings.NewReplacer(
 		"{summary}", summary,
 		"{sender}", first(sender, "a person"),
 		"{message}", message,
-	).Replace(string(data)), nil
+	).Replace(template), nil
 }
 
 func first(value, fallback string) string {
