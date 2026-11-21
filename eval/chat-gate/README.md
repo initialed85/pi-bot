@@ -34,6 +34,11 @@ Design decisions baked into the prompts:
 - summary is additive-merge with a hard 30-word cap; unchanged messages pass through.
 
 Bridge integration contract (for build-google-chat-bot):
+- **`initialed85/pi-bot` has never been registered in Woodpecker** (home-ops confirmed 2026-11-21 by reading
+  `woodpecker-postgres`: no row in `repos`, and zero pipelines for `5e16eb3`, `54426e0`, `5b75505` or `f13fc7f`).
+  So `.woodpecker/ci.yaml` and `.woodpecker/build.yaml` are inert for this repo, and every image so far has been
+  built and pushed by hand from the build lane. Nothing enforces the checks below automatically - run them.
+  Activating the repo needs a human Woodpecker login (same flow `mcbot` needed as repo id 35).
 - The bridge embeds these prompts (`internal/chatgate/prompts/`, `go:embed`). **Prompt text is owned
   here.** Edit `prompts/*.md`, re-run the eval, then `node revendor.mjs` to copy them into the bridge.
   The authoritative equality check is `internal/chatgate/prompt_drift_test.go`: it fetches these files
