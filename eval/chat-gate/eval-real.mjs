@@ -31,18 +31,27 @@ function extract(path) {
   for (const line of readFileSync(path, "utf8").split("\n")) {
     let j; try { j = JSON.parse(line); } catch { continue; }
     const m = j.message || {};
-    if (m.role !== "user") continue;
     let c = m.content;
     if (Array.isArray(c)) c = c.map((x) => x?.text ?? "").join(" ");
-    if (typeof c !== "string" || !c.includes("[pi-chat:")) continue;
-    const body = c.split("[chat bridge")[0];
-    const text = body.replace(/^\s*\[pi-chat:[0-9a-f]+\][^:]*:\s*/, "").trim();
-    if (text) out.push({ ts: j.timestamp, text });
+    if (typeof c !== "string") continue;
+    // Bridged user turns carry the [pi-chat:... marker; the bot's own replies are the
+    // context the live thread summary would have contained, so both must be kept.
+    if (m.role === "user" && c.includes("[pi-chat:")) {
+      const text = c.split("[chat bridge")[0].replace(/^\s*\[pi-chat:[0-9a-f]+\][^:]*:\s*/, "").trim();
+      if (text) out.push({ ts: j.timestamp, role: "user", text });
+    } else if (m.role === "assistant" && c.trim()) {
+      out.push({ ts: j.timestamp, role: "bot", text: c.trim() });
+    } else if (m.role === "toolResult") {
+      // Tool output is how pi-chat actually did things; keep a marker so the model can
+      // see the bot acted between turns.
+      out.push({ ts: j.timestamp, role: "bot", text: `<ran a tool>` });
+    }
   }
   return out;
 }
 
-const msgs = files.flatMap(extract);
+const all = files.flatMap(extract);
+const msgs = all.filter((m) => m.role === "user");
 if (!msgs.length) { console.error("no bridged messages found"); process.exit(1); }
 
 async function run(prompt, maxTokens = 4) {
@@ -63,8 +72,12 @@ let threadWrong = 0, respondWrong = 0;
 for (let i = 0; i < msgs.length; i++) {
   const m = msgs[i];
   const threadAns = await run(threadTpl.replaceAll("{message}", m.text));
-  // Real context: what the bot itself last said, truncated, stands in for the summary.
-  const prior = msgs.slice(Math.max(0, i - 3), i).map((p) => p.text).join(" | ");
+  // Mirror the live bridge: the summary must contain pi-chat's own recent turns, since the
+  // prompt decides on "is this reacting to what pi-chat said?".
+  const ai = all.indexOf(m);
+  const prior = all.slice(Math.max(0, ai - 8), ai)
+    .map((p) => `${p.role === "bot" ? "pi-chat" : "Robin"}: ${p.text.replace(/\s+/g, " ").slice(0, 140)}`)
+    .join(" | ");
   const respondAns = await run(
     respondTpl.replaceAll("{summary}", prior || "start of the conversation")
       .replaceAll("{sender}", "Robin").replaceAll("{message}", m.text), 4);
