@@ -20,6 +20,11 @@ Design decisions baked into the prompts:
 - summary is additive-merge with a hard 30-word cap; unchanged messages pass through.
 
 Bridge integration contract (for build-google-chat-bot):
+- The bridge embeds these prompts (`internal/chatgate/prompts/`, `go:embed`). **Prompt text is owned
+  here.** Edit `prompts/*.md`, re-run the eval, then `node check-vendored.mjs --write` to re-vendor.
+  Never edit the vendored copy directly - `check-vendored.mjs` compares them byte-for-byte and exits
+  1 on drift, so a silent fork fails the gate instead of quietly invalidating the numbers above.
+  Run it in CI alongside `go test ./...`.
 - DM (1:1): no should-respond gate - a DM is always for the bot. Untagged: ask thread-request;
   THREAD -> open thread + forward, INLINE -> answer in-line.
 - Group space, top level, untagged: OPEN QUESTION, Ed to confirm. Current bridge behaviour is to
