@@ -41,12 +41,12 @@ func TestVendoredPromptsMatchPiBotMaster(t *testing.T) {
 			t.Fatalf("vendored prompt %s differs from pi-bot master (%s); either re-vendor or re-run the eval", flow, VendoredPromptSource)
 		}
 	}
-	if !strings.Contains(VendoredPromptSource, "404b884") {
+	if !strings.Contains(VendoredPromptSource, "c34f21a") {
 		t.Fatalf("vendored prompt source must record the evaluated pi-bot revision, got %q", VendoredPromptSource)
 	}
 }
 
 func ExampleVendoredPromptSource() {
 	fmt.Println(VendoredPromptSource)
-	// Output: initialed85/pi-bot@404b884
+	// Output: initialed85/pi-bot@c34f21af50966d310b3427531f093f5f7afa4c81
 }

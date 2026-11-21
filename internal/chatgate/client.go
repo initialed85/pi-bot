@@ -26,7 +26,7 @@ var promptFiles embed.FS
 
 // VendoredPromptSource identifies the evaluated prompt revision copied into this binary.
 // Prompt text is owned by pi-bot; re-vendor after changing it there and re-run its eval.
-const VendoredPromptSource = "initialed85/pi-bot@404b884"
+const VendoredPromptSource = "initialed85/pi-bot@c34f21af50966d310b3427531f093f5f7afa4c81"
 
 // PromptText returns the exact source template shipped in the bridge.
 func PromptText(flow string) (string, error) {
