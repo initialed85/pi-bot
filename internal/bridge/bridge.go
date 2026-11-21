@@ -92,8 +92,8 @@ type Config struct {
 	// session and Pi needs to know whose request it is honouring.
 	PrefixWithSender bool
 
-	// ReplyGateMode is off, dry-run, or enforce. The application defaults to dry-run; the library
-	// default is off so tests and embedders never make an unexpected network call.
+	// ReplyGateMode is off, dry-run, or enforce. The application and library default to off so a
+	// dev-only classifier never becomes an unexpected production dependency.
 	ReplyGateMode     string
 	ReplyGate         chatgate.Classifier
 	ReplyGateEndpoint string

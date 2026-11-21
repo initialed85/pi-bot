@@ -31,7 +31,7 @@
 //	PI_CHAT_IMAGE_MAX_MB       per-attachment download cap (default 4)
 //	PI_CHAT_MAX_IMAGES         attachments forwarded per message (default 4)
 //	PI_CHAT_ALLOW_ANY_ROOM_MESSAGE  set to 1 to treat unmentioned room messages as prompts
-//	PI_CHAT_REPLY_GATE_MODE    off|dry-run|enforce (default dry-run; enforce suppresses/reroutes)
+//	PI_CHAT_REPLY_GATE_MODE    off|dry-run|enforce (default off; dry-run logs, enforce suppresses/reroutes)
 //	PI_CHAT_REPLY_GATE_URL     OpenAI-compatible gate endpoint (default sentiment-analyzer.dev...)
 //	PI_CHAT_REPLY_GATE_MODEL   gate model name
 //	PI_CHAT_REPLY_GATE_TIMEOUT_SECONDS  classifier deadline (default 2)
@@ -272,9 +272,9 @@ func loadSettings() (settings, error) {
 	}
 	s.cfg.StatusMode = envDefault("PI_CHAT_STATUS_MODE", s.cfg.StatusMode)
 	s.cfg.DeliverAs = envDefault("PI_CHAT_DELIVER_AS", s.cfg.DeliverAs)
-	// Dry-run is deliberately the application default: every gate decision is logged, but Chat
-	// behaviour remains unchanged until Ed explicitly switches this to enforce.
-	s.cfg.ReplyGateMode = envDefault("PI_CHAT_REPLY_GATE_MODE", "dry-run")
+	// The classifier is dev-only and can add seconds on a cold call, so the application is opt-in:
+	// set dry-run for review, then enforce only after Ed approves the logs.
+	s.cfg.ReplyGateMode = envDefault("PI_CHAT_REPLY_GATE_MODE", "off")
 	s.cfg.ReplyGateEndpoint = envDefault("PI_CHAT_REPLY_GATE_URL", "https://sentiment-analyzer.dev.initialed85.cc")
 	s.cfg.ReplyGateModel = envDefault("PI_CHAT_REPLY_GATE_MODEL", "unsloth/gemma-4-E4B-it-GGUF:IQ4_XS")
 	s.cfg.ReplyGateTimeout = seconds("PI_CHAT_REPLY_GATE_TIMEOUT_SECONDS", 2*time.Second)

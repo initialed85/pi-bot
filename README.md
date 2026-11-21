@@ -88,12 +88,13 @@ message in a shared room is ignored. A bot that answers strangers tells them the
 
 ## Optional reply gate
 
-The bridge includes a small-model reply gate for untagged messages. It is **dry-run by default**:
-it calls the OpenAI-compatible classifier, logs one structured `reply gate` decision per gated message,
-and preserves the existing Chat behaviour. It never gates `@pi-chat` messages.
+The bridge includes an optional small-model reply gate for untagged messages. It is **off by
+default** because the classifier is a dev-only dependency that can be slow while cold. Set dry-run
+explicitly to call the OpenAI-compatible classifier, log one structured `reply gate` decision per
+gated message, and preserve the existing Chat behaviour. It never gates `@pi-chat` messages.
 
 ```bash
-PI_CHAT_REPLY_GATE_MODE=dry-run       # off | dry-run | enforce (application default: dry-run)
+PI_CHAT_REPLY_GATE_MODE=dry-run       # off | dry-run | enforce (application default: off)
 PI_CHAT_REPLY_GATE_URL=https://sentiment-analyzer.dev.initialed85.cc
 PI_CHAT_REPLY_GATE_MODEL=unsloth/gemma-4-E4B-it-GGUF:IQ4_XS
 PI_CHAT_REPLY_GATE_TIMEOUT_SECONDS=2
