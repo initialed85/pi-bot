@@ -1,0 +1,3 @@
+# Real transcripts must never be written into this public repo.
+real-*.jsonl
+/tmp/

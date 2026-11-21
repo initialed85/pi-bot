@@ -1,0 +1,22 @@
+{"id": "sr-01", "split": "for-bot", "summary": "Sam's 6th birthday party planning. pi-chat listed expected guests from the calendar.", "sender": "Robin", "message": "pi-chat what time should people arrive?", "label": "YES"}
+{"id": "sr-02", "split": "for-bot", "summary": "Sam's 6th birthday party planning. pi-chat listed expected guests from the calendar.", "sender": "Sam", "message": "and can you check if the weather will be rough that afternoon?", "label": "YES"}
+{"id": "sr-03", "split": "for-bot", "summary": "pi-chat has been downloading the Xbox update on demand and reporting speed.", "sender": "Robin", "message": "how's the download going now", "label": "YES"}
+{"id": "sr-04", "split": "for-bot", "summary": "pi-chat reported the kids room temperature as 21.6C.", "sender": "Robin", "message": "that seems cold, what was it overnight?", "label": "YES"}
+{"id": "sr-05", "split": "for-bot", "summary": "Robin asked pi-chat to keep an eye on the hermes PSU issue and remind him.", "sender": "Robin", "message": "right and did you ever find what watt PSU it needs?", "label": "YES"}
+{"id": "sr-06", "split": "for-bot", "summary": "pi-chat summarised Uber Eats spend for the last 6 months.", "sender": "Sam", "message": "did it include the paypal ones or just the card?", "label": "YES"}
+{"id": "sr-07", "split": "for-bot", "summary": "pi-chat said the party guest list came from the calendar invite.", "sender": "Robin", "message": "you missed grandma in that list right?", "label": "YES"}
+{"id": "sr-08", "split": "for-bot", "summary": "pi-chat posted a weather rundown for tomorrow.", "sender": "Sam", "message": "whats the wind like around 5pm", "label": "YES"}
+{"id": "sr-09", "split": "for-bot", "summary": "Robin asked pi-chat to watch for the Xbox download finishing.", "sender": "Robin", "message": "ping me here the second it's done", "label": "YES"}
+{"id": "sr-10", "split": "for-bot", "summary": "pi-chat explained the kids room sensor reads from VictoriaMetrics.", "sender": "Robin", "message": "can you set up a schedule to tell us if it goes over 26 tomorrow", "label": "YES"}
+{"id": "sr-11", "split": "not-for-bot", "summary": "Sam's 6th birthday party planning. pi-chat listed expected guests from the calendar.", "sender": "Sam", "message": " babe did you order the balloons yet?", "label": "NO"}
+{"id": "sr-12", "split": "not-for-bot", "summary": "Sam's 6th birthday party planning. pi-chat listed expected guests from the calendar.", "sender": "Robin", "message": "yeah they're in the car right now", "label": "NO"}
+{"id": "sr-13", "split": "not-for-bot", "summary": "Sam's 6th birthday party planning. pi-chat last said the cake is booked.", "sender": "Sam", "message": "lol remember when she cried over the puppet show last year", "label": "NO"}
+{"id": "sr-14", "split": "not-for-bot", "summary": "pi-chat answered a question about who is coming to the party.", "sender": "Robin", "message": "also grab napkins from the drawer when you're at dodas", "label": "NO"}
+{"id": "sr-15", "split": "not-for-bot", "summary": "pi-chat reported Uber Eats spend of $1868 over 6 months.", "sender": "Sam", "message": "six months?? we eat that much food", "label": "NO"}
+{"id": "sr-16", "split": "not-for-bot", "summary": "pi-chat reported Uber Eats spend of $1868 over 6 months.", "sender": "Robin", "message": "lmao that june month was all the footy finals", "label": "NO"}
+{"id": "sr-17", "split": "not-for-bot", "summary": "pi-chat listed the expected party guests.", "sender": "Sam", "message": "mum says she and dad will bring the esky", "label": "NO"}
+{"id": "sr-18", "split": "not-for-bot", "summary": "pi-chat is monitoring the xbox download and reports speed when asked.", "sender": "Robin", "message": "ok love im heading to the station now", "label": "NO"}
+{"id": "sr-19", "split": "not-for-bot", "summary": "pi-chat gave the weather for tomorrow: 19C and breezy.", "sender": "Sam", "message": "breezy they say. the shade tree is going to flatten the tent", "label": "NO"}
+{"id": "sr-20", "split": "not-for-bot", "summary": "pi-chat confirmed the party date is the 6th.", "sender": "Robin", "message": "happy birthday to my favourite girl  ❤️", "label": "NO"}
+{"id": "sr-21", "split": "not-for-bot", "summary": "pi-chat summarised the hermes PSU problem and the fix.", "sender": "Sam", "message": "pass me the tesla cable will you", "label": "NO"}
+{"id": "sr-22", "split": "not-for-bot", "summary": "pi-chat answered where the kids bike helmet sizes are.", "sender": "Robin", "message": "brb taking this call", "label": "NO"}

@@ -1,0 +1,5 @@
+{"id": "sm-01", "summary": "Sam's 6th birthday party planning; pi-chat listed expected guests from the calendar.", "sender": "Robin", "message": "cake is booked, chocolate, from the place on james street", "label": "UPDATED", "mustInclude": "cake"}
+{"id": "sm-02", "summary": "Sam's 6th birthday party planning; cake booked for chocolate from James St.", "sender": "Sam", "message": "balloons are in the car", "label": "UPDATED", "mustInclude": "balloon"}
+{"id": "sm-03", "summary": "pi-chat reported uber eats spend of $1868 over the last 6 months.", "sender": "Sam", "message": "lol we eat that much", "label": "UNCHANGED", "mustInclude": "1868"}
+{"id": "sm-04", "summary": "Xbox update downloading; pi-chat reports speed when asked, started at 250Mbps.", "sender": "Robin", "message": "pi-chat is it finished yet", "label": "UPDATED", "mustInclude": "xbox"}
+{"id": "sm-05", "summary": "Kids room at 21.6C; pi-chat monitoring and will alert over 26C tomorrow.", "sender": "Robin", "message": "can you also watch the office sensor, it gets brutal in the afternoon", "label": "UPDATED", "mustInclude": "office"}

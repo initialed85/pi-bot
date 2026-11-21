@@ -1,0 +1,16 @@
+{"id": "tr-01", "message": "pi-chat who's coming to sam's party", "label": "INLINE"}
+{"id": "tr-02", "message": "what's the weather tomorrow", "label": "INLINE"}
+{"id": "tr-03", "message": "check the kids room temp", "label": "INLINE"}
+{"id": "tr-04", "message": "let's do a thread on the party planning, keep it separate from this chat", "label": "THREAD"}
+{"id": "tr-05", "message": "can we dig into the hermes psu thing properly - make it its own thread", "label": "THREAD"}
+{"id": "tr-06", "message": "pi-chat i want to deep dive on the electricity contract, start a thread for it", "label": "THREAD"}
+{"id": "tr-07", "message": "this needs more thought, lets take it to a thread", "label": "THREAD"}
+{"id": "tr-08", "message": "reply in a thread to this one so it doesn't get lost", "label": "THREAD"}
+{"id": "tr-09", "message": "how much did we spend on uber eats last 6 months", "label": "INLINE"}
+{"id": "tr-10", "message": "this is a big one, can you write a proper plan for the party logistics in a thread", "label": "THREAD"}
+{"id": "tr-11", "message": "lunch ideas for tuesday?", "label": "INLINE"}
+{"id": "tr-12", "message": "don't answer here, thread it - i want to iterate on the gift shortlist without cluttering", "label": "THREAD"}
+{"id": "tr-13", "message": "i've been thinking about buying a new esky, what should i get", "label": "INLINE"}
+{"id": "tr-14", "message": "pi-chat let's focus on the xbox storage issue as its own conversation, thread please", "label": "THREAD"}
+{"id": "tr-15", "message": "summarise the fortnightly reports for me", "label": "INLINE"}
+{"id": "tr-16", "message": "long topic incoming - start a thread, i'll paste the whole contract and want a breakdown", "label": "THREAD"}
