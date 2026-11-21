@@ -460,9 +460,10 @@ func (b *Bridge) replyGate(ctx context.Context, ev *chatmsg.Event, message strin
 	}
 	action := "dry-run-forward"
 	if err != nil {
-		if ev.DM {
+		if ev.DM || b.cfg.ReplyGateMode == "enforce" {
 			action = "fallback-inline"
 		} else {
+			// Preserve the dry-run diagnostic/action shape; dry-run never suppresses regardless.
 			action = "fallback-silent"
 		}
 	} else if strings.EqualFold(firstWord(answer), "NO") && !ev.DM {
@@ -482,7 +483,7 @@ func (b *Bridge) replyGate(ctx context.Context, ev *chatmsg.Event, message strin
 	b.log.Info("reply gate", "thread", ev.Thread, "flow", flow, "prompt", prompt, "answer", answer, "latency_ms", time.Since(started).Milliseconds(), "action", loggedAction)
 	if b.cfg.ReplyGateMode == "enforce" {
 		switch decision {
-		case "suppress", "fallback-silent":
+		case "suppress":
 			return replyThread, true
 		case "thread":
 			// ev.Thread is the DM's synthetic space thread. Empty means create a new Chat thread.

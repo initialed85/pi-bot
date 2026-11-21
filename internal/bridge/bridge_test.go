@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -1235,7 +1236,7 @@ func TestReplyGate_InvalidClassifierTokenFallsBack(t *testing.T) {
 		wantSuppress bool
 	}{
 		{dm: true},
-		{dm: false, wantSuppress: true},
+		{dm: false, wantSuppress: false},
 	} {
 		gate := &fakeGate{answers: map[string]string{
 			chatgate.FlowThreadRequest: "THREAD because...",
@@ -1258,17 +1259,22 @@ func TestReplyGate_Fallbacks(t *testing.T) {
 		wantThread   string
 	}{
 		{name: "dm classifier failure", dm: true, wantThread: "spaces/test/threads/thread-1"},
-		{name: "thread classifier failure", dm: false, wantSuppress: true, wantThread: "spaces/test/threads/thread-1"},
+		{name: "thread classifier failure", dm: false, wantSuppress: false, wantThread: "spaces/test/threads/thread-1"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			gate := &fakeGate{answers: map[string]string{}, errs: map[string]error{
 				chatgate.FlowThreadRequest: fmt.Errorf("timeout"),
 				chatgate.FlowShouldRespond: fmt.Errorf("HTTP 503"),
 			}}
-			b := New(&fakeChat{}, &fakeGateway{}, Config{ReplyGateMode: "enforce", ReplyGate: gate, RequireMentionInRooms: false}, nil)
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&logs, nil))
+			b := New(&fakeChat{}, &fakeGateway{}, Config{ReplyGateMode: "enforce", ReplyGate: gate, RequireMentionInRooms: false}, logger)
 			got, suppress := b.replyGate(context.Background(), gateEvent(test.dm, false), "hello")
 			if suppress != test.wantSuppress || got != test.wantThread {
 				t.Fatalf("route=%q suppress=%v, want route=%q suppress=%v", got, suppress, test.wantThread, test.wantSuppress)
+			}
+			if !test.dm && !strings.Contains(logs.String(), "action=fallback-inline") {
+				t.Fatalf("logs=%q, want action=fallback-inline", logs.String())
 			}
 		})
 	}
