@@ -28,8 +28,9 @@ Bridge integration contract (for build-google-chat-bot):
   numbers above were measured at. Never edit the vendored copy - it would fail their CI, not ours.
 - DM (1:1): no should-respond gate - a DM is always for the bot. Untagged: ask thread-request;
   THREAD -> open thread + forward, INLINE -> answer in-line.
-- Group space, top level, untagged: OPEN QUESTION, Ed to confirm. Current bridge behaviour is to
-  reply to everything; the natural extension of his intent is to gate it through should-respond too.
+- Group space, TOP LEVEL, untagged: IGNORE - hard rule, no classifier call (Ed's call, 2026-11-21).
+  pi-chat only ever engages in a group when it has been tagged into that thread; untagged room noise
+  is never forwarded and never scored. This also keeps the model off the hot path for group chatter.
 - Thread, untagged: (summary, message) -> should-respond; NO -> suppress AND update summary,
   YES -> forward with summary attached as context, update summary.
 - @pi-chat: never gates. Deterministic reply.
