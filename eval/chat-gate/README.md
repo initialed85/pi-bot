@@ -37,3 +37,17 @@ Bridge integration contract (for build-google-chat-bot):
 - Classifier error/timeout (>2s): DMs answer in-line (never thread); in-thread default is
   SILENT unless tagged. Keep the small model warm so timeouts stay rare.
 - Rollout: dry-run flag first (log decisions, suppress nothing), then enforce.
+
+## Reviewing live decisions
+
+`gate-logs.mjs` renders the deployed bridge's dry-run decisions as a table, plus the
+only list that matters before enforce: what it *would* have suppressed, what it would
+have rerouted into a side thread, and any call approaching the 2s deadline.
+
+    node eval/chat-gate/gate-logs.mjs --since 24h        # live pod logs via kubectl
+    node eval/chat-gate/gate-logs.mjs --stdin < logs.txt # or pasted lines
+    node eval/chat-gate/gate-logs.mjs --json             # machine-readable
+
+It reads `kubectl logs deploy/pi-bot-bridge` in the dev cluster directly rather than
+depending on log shipping. Top-level group messages ignored *without* a model call are
+counted separately - those should be numerous and cost nothing.
