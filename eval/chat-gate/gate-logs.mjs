@@ -3,12 +3,17 @@
 // before flipping the gate to enforce.
 //
 //   node gate-logs.mjs [--tail 5000] [--since 24h] [--context home-dev] [--ns slopyphus] [--json]
+//                       [--pod <name>] [--archive <path-append-jsonl>]
+//
+// `--pod` reads one specific pod (use it on the OLD pod before a roll, whose logs are then
+// destroyed); `--archive` appends the raw lines to a file OUTSIDE this repo so a rollout cannot
+// delete the evidence. Live transcripts are personal data - never archive them into a public tree.
 //
 // Reads live pod logs via kubectl (authoritative; no dependency on log shipping).
 // Dry-run logs every decision it WOULD have made, so the "would have suppressed"
 // column is the actual risk of enforce - that is the list to read.
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 
 const args = process.argv.slice(2);
 const flag = (name, dflt) => {
@@ -19,12 +24,15 @@ const ctx = flag("context", "home-dev");
 const ns = flag("ns", "slopyphus");
 const tail = Number(flag("tail", 5000));
 const since = flag("since", "24h");
+const pod = flag("pod", null);
+const archive = flag("archive", null);
 
 let raw;
 if (args.includes("--stdin")) {
   raw = readFileSync(0, "utf8");
 } else {
-  const out = spawnSync("kubectl", ["--context", ctx, "-n", ns, "logs", "deploy/pi-bot-bridge",
+  const target = pod ? `pod/${pod}` : "deploy/pi-bot-bridge";
+  const out = spawnSync("kubectl", ["--context", ctx, "-n", ns, "logs", target,
     `--tail=${tail}`, `--since=${since}`, "--all-containers"], { encoding: "utf8", maxBuffer: 64 << 20 });
   if (out.status !== 0) {
     console.error("kubectl logs failed:", (out.stderr || "").slice(0, 400));
@@ -33,11 +41,14 @@ if (args.includes("--stdin")) {
   raw = out.stdout;
 }
 
+if (archive) appendFileSync(archive, raw.endsWith("\n") ? raw : raw + "\n");
+
 const decisions = [], ignored = [];
-let warm = null;
+let warm = null, earliest = null;
 for (const line of raw.split("\n")) {
   if (!line.startsWith("{")) continue;
   let j; try { j = JSON.parse(line); } catch { continue; }
+  if (j.time && (earliest === null || Date.parse(j.time) < earliest)) earliest = Date.parse(j.time);
   if (j.msg === "reply gate") decisions.push(j);
   else if (j.msg === "group message outside a pi-chat thread; ignoring") ignored.push(j);
   else if (j.msg === "reply gate warm-up failed") warm = `warm-up FAILED: ${j.err}`;
@@ -86,6 +97,19 @@ if (flag("json", null) !== null) { console.log(JSON.stringify({ warm, rows, igno
 
 console.log(`warm-up state: ${warm ?? "no warm-up line in the window"}`);
 console.log(`group top-level messages ignored with zero model calls: ${ignored.length}`);
+const windowMs = (() => {
+  const m = /^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?$/.exec(since);
+  if (!m) return null;
+  return ((+m[1] || 0) * 86400 + (+m[2] || 0) * 3600 + (+m[3] || 0) * 60) * 1000;
+})();
+if (windowMs && earliest !== null && Date.now() - earliest > windowMs * 0.9) {
+  // logs really do cover the window
+} else if (windowMs && earliest !== null) {
+  const covered = Math.round((Date.now() - earliest) / 60000);
+  console.log(`\nEVIDENCE BOUNDARY: asked for ${since}, but these logs only reach back ~${covered} min.`);
+  console.log("Anything older is gone - the pod that held it was deleted, and there is no log shipping.");
+  console.log("A quiet table therefore means 'the gate was never consulted', not 'the gate behaved'.");
+}
 if (!rows.length) {
   console.log(`\nNo gate decisions in this window. Expected: an untagged DM (flow=thread-request) and`);
   console.log(`untagged follow-ups inside a thread pi-chat was tagged into (flow=should-respond).`);

@@ -86,3 +86,30 @@ have rerouted into a side thread, and any call approaching the 2s deadline.
 It reads `kubectl logs deploy/pi-bot-bridge` in the dev cluster directly rather than
 depending on log shipping. Top-level group messages ignored *without* a model call are
 counted separately - those should be numerous and cost nothing.
+
+**A roll destroys evidence.** `logs deploy/...` only sees the *current* pod, and pods are
+deleted on rollout, so everything before the last restart is unrecoverable - there is no log
+shipping to fall back on. Capture the window you care about *before* rolling (`kubectl logs
+pi-bot-bridge-<old-pod> > /tmp/pre-roll.jsonl`), and keep such captures outside this repo:
+live transcripts are personal data and this repository is public.
+
+## What the gate can actually see in a group room (as of 2026-11-21)
+
+Two transport facts, both verified against the deployed credential, mean `should-respond`
+currently has no way to run in a room at all:
+
+1. **Untagged room messages never reach the bridge.** Only DMs and @-mentions arrive as push
+   events; a mention skips the gate by design, so it logs no decision. Zero group messages
+   produced a gate line all day.
+2. **Thread ownership does not survive a restart.** The lookup added in `5e16eb3`
+   (`HasBotMessage`) calls `spaces.messages.list`, and that read is permanently refused for
+   this app - `chat.bot` gets a 403 and the wider `chat.app.messages.readonly` scopes return
+   "requires administrator approval ... requires a Google Workspace organization". Ownership
+   is therefore in-process only, and a roll makes pi-chat forget the threads it was tagged
+   into, whose untagged follow-ups then get ignored without a model call.
+
+Consequence for any review: **an empty decision table in enforce is the expected result, not
+evidence the gate is well-behaved.** "No suppressions" today means "the gate was never
+consulted", so group behaviour must be judged from offline eval (`eval.mjs`, `eval-real.mjs`)
+until ingress and ownership are fixed. Untagged DM follow-ups produce no line either - a DM is
+always answered and the `thread-request` gate fires only for unmentioned ones.
