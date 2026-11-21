@@ -44,7 +44,11 @@ for (const line of raw.split("\n")) {
   else if (j.msg === "reply gate warm") warm = "warm-up ok";
 }
 
-const WOULD_SUPPRESS = new Set(["suppress", "fallback-silent", "dry-run-suppress", "dry-run-fallback-silent"]);
+// Only a clean NO suppresses. Since 54426e0 the bridge FAILS OPEN on classifier
+// errors, so the legacy dry-run label `fallback-silent` means "classifier could not
+// decide" - enforce answers inline for that. Do not treat it as suppression.
+const WOULD_SUPPRESS = new Set(["suppress", "dry-run-suppress"]);
+const FAILED = new Set(["fallback-silent", "dry-run-fallback-silent", "fallback-inline", "dry-run-fallback-inline"]);
 const rows = decisions.map((d) => {
   // The prompt is a rendered multi-line string; the message is the line after
   // the "Latest message..." header, up to the next blank line.
@@ -71,6 +75,7 @@ const rows = decisions.map((d) => {
     flow: d.flow, answer: d.answer, ms: d.latency_ms, action: d.action,
     message: text.trim().slice(0, 70),
     suppresses: WOULD_SUPPRESS.has(d.action),
+    failed: FAILED.has(d.action),
     reroutes: /(^|-)thread$/.test(d.action ?? ""),
     fallback: /(^|-)fallback-/.test(d.action ?? ""),
     summary: s >= 0 ? lines.slice(s + 1).find((l) => l.trim() !== "")?.trim().slice(0, 60) ?? "" : "",
@@ -103,8 +108,8 @@ if (rerouted.length) {
 }
 const answered = rows.filter((r) => !r.suppresses && !r.reroutes).length;
 console.log(`   (${answered} answered in place)`);
-const fb = rows.filter((r) => r.fallback);
-if (fb.length) console.log(`   ${fb.length} classifier FAILURE(S)/timeout(s) - the gate did not decide, the fallback did:\n` +
-  fb.map((r) => `     [${r.time}] ${r.flow} -> ${r.action} after ${r.ms}ms (enforce behaviour: ${r.action.includes("silent") ? "IGNORED THE MESSAGE" : "answered anyway"})`).join("\n"));
+const fb = rows.filter((r) => r.failed);
+if (fb.length) console.log(`   ${fb.length} classifier FAILURE(S)/timeout(s) - the gate did not decide; since 54426e0 enforce answers anyway (fail open):\n` +
+  fb.map((r) => `     [${r.time}] ${r.flow} -> ${r.action} after ${r.ms}ms`).join("\n"));
 const slow = rows.filter((r) => r.ms >= 1500);
-if (slow.length) console.log(`\n   ${slow.length} call(s) >=1500ms - approaching the 2s deadline (enforce would fall back on these)`);
+if (slow.length) console.log(`\n   ${slow.length} call(s) >=1500ms - near the 2s deadline; slow, but fail-open means these still get answered`);
