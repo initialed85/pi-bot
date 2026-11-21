@@ -21,10 +21,11 @@ Design decisions baked into the prompts:
 
 Bridge integration contract (for build-google-chat-bot):
 - The bridge embeds these prompts (`internal/chatgate/prompts/`, `go:embed`). **Prompt text is owned
-  here.** Edit `prompts/*.md`, re-run the eval, then `node check-vendored.mjs --write` to re-vendor.
-  Never edit the vendored copy directly - `check-vendored.mjs` compares them byte-for-byte and exits
-  1 on drift, so a silent fork fails the gate instead of quietly invalidating the numbers above.
-  Run it in CI alongside `go test ./...`.
+  here.** Edit `prompts/*.md`, re-run the eval, then `node revendor.mjs` to copy them into the bridge.
+  The authoritative equality check is `internal/chatgate/prompt_drift_test.go`: it fetches these files
+  from pi-bot master over HTTP, fails `go test ./...` on any mismatch, and asserts that the recorded
+  evaluated revision (`VendoredPromptSource`, currently `initialed85/pi-bot@404b884`) is the one the
+  numbers above were measured at. Never edit the vendored copy - it would fail their CI, not ours.
 - DM (1:1): no should-respond gate - a DM is always for the bot. Untagged: ask thread-request;
   THREAD -> open thread + forward, INLINE -> answer in-line.
 - Group space, top level, untagged: OPEN QUESTION, Ed to confirm. Current bridge behaviour is to
