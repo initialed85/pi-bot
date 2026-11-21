@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -42,10 +43,13 @@ type Classifier interface {
 }
 
 type Client struct {
-	endpoint string
-	model    string
-	http     *http.Client
-	timeout  time.Duration
+	endpoint    string
+	model       string
+	http        *http.Client
+	timeout     time.Duration
+	warmBackoff []time.Duration
+	warmMu      sync.RWMutex
+	warm        bool
 }
 
 func New(endpoint, model string, timeout time.Duration) *Client {
@@ -59,7 +63,7 @@ func New(endpoint, model string, timeout time.Duration) *Client {
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
-	return &Client{endpoint: endpoint, model: model, http: &http.Client{}, timeout: timeout}
+	return &Client{endpoint: endpoint, model: model, http: &http.Client{}, timeout: timeout, warmBackoff: []time.Duration{5 * time.Second, 10 * time.Second}}
 }
 
 func (c *Client) Classify(ctx context.Context, flow, summary, sender, message string) (string, string, time.Duration, error) {
@@ -117,12 +121,42 @@ func (c *Client) Classify(ctx context.Context, flow, summary, sender, message st
 }
 
 // Warm asks the model for a cheap classification so the first real message does not pay cold-start
-// latency. It has a deliberately longer deadline than normal gating.
+// latency. It retries warm-up only: user-facing Classify calls never retry and retain their 2s
+// deadline. The backoff plus three 2s attempts fits comfortably inside the 30s warm-up budget.
 func (c *Client) Warm(ctx context.Context) error {
+	if c.IsWarm() {
+		return nil
+	}
 	warmCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	_, _, _, err := c.Classify(warmCtx, FlowShouldRespond, "", "system", "ping")
-	return err
+	var last error
+	attempts := len(c.warmBackoff) + 1
+	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 {
+			timer := time.NewTimer(c.warmBackoff[attempt-1])
+			select {
+			case <-warmCtx.Done():
+				timer.Stop()
+				return warmCtx.Err()
+			case <-timer.C:
+			}
+		}
+		_, _, _, last = c.Classify(warmCtx, FlowShouldRespond, "", "system", "ping")
+		if last == nil {
+			c.warmMu.Lock()
+			c.warm = true
+			c.warmMu.Unlock()
+			return nil
+		}
+	}
+	return fmt.Errorf("chatgate: warm-up failed after %d attempts: %w", attempts, last)
+}
+
+// IsWarm reports whether a warm-up attempt has actually succeeded.
+func (c *Client) IsWarm() bool {
+	c.warmMu.RLock()
+	defer c.warmMu.RUnlock()
+	return c.warm
 }
 
 func prompt(flow, summary, sender, message string) (string, error) {
