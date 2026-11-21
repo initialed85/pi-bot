@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/initialed85/pi-bot/internal/chatapi"
+	"github.com/initialed85/pi-bot/internal/chatgate"
 	"github.com/initialed85/pi-bot/internal/chatmsg"
 	"github.com/initialed85/pi-bot/internal/gateway"
 )
@@ -87,9 +88,17 @@ type Config struct {
 	// ImageMaxBytes and MaxImages bound inbound media so one 20MB upload cannot wedge the session.
 	ImageMaxBytes int64
 	MaxImages     int
-	// PrefixWithSender names who a prompt came from, which matters the moment Amy and Ed share a
+	// PrefixWithSender names who a prompt came from, which matters when multiple people share a
 	// session and Pi needs to know whose request it is honouring.
 	PrefixWithSender bool
+
+	// ReplyGateMode is off, dry-run, or enforce. The application defaults to dry-run; the library
+	// default is off so tests and embedders never make an unexpected network call.
+	ReplyGateMode     string
+	ReplyGate         chatgate.Classifier
+	ReplyGateEndpoint string
+	ReplyGateModel    string
+	ReplyGateTimeout  time.Duration
 }
 
 func DefaultConfig() Config {
@@ -105,6 +114,8 @@ func DefaultConfig() Config {
 		MaxImages:             4,
 		RequireMentionInRooms: true,
 		PrefixWithSender:      true,
+		ReplyGateMode:         "off",
+		ReplyGateTimeout:      2 * time.Second,
 	}
 }
 
@@ -149,6 +160,19 @@ func (c Config) withDefaults() Config {
 	if c.MaxImages > 0 {
 		d.MaxImages = c.MaxImages
 	}
+	mode := strings.ToLower(strings.TrimSpace(c.ReplyGateMode))
+	switch mode {
+	case "off", "dry-run", "enforce":
+		d.ReplyGateMode = mode
+	default:
+		d.ReplyGateMode = DefaultConfig().ReplyGateMode
+	}
+	if c.ReplyGateTimeout > 0 {
+		d.ReplyGateTimeout = c.ReplyGateTimeout
+	}
+	d.ReplyGate = c.ReplyGate
+	d.ReplyGateEndpoint = c.ReplyGateEndpoint
+	d.ReplyGateModel = c.ReplyGateModel
 	d.Allowlist = c.Allowlist
 	d.RequireMentionInRooms = c.RequireMentionInRooms
 	d.PrefixWithSender = c.PrefixWithSender
@@ -166,6 +190,8 @@ type Bridge struct {
 	seenQ     []string
 	watches   map[string]*watch // space -> in-flight watch, so /stop can reach it
 	delivered map[string]bool   // gateway turn id -> its answer has already been posted
+	summaries map[string]string // thread -> <=30-word running summary for the reply gate
+	gate      chatgate.Classifier
 	lastSpace string
 	watchers  sync.WaitGroup
 }
@@ -194,15 +220,32 @@ func New(chat Chat, gw Gateway, cfg Config, log *slog.Logger) *Bridge {
 			log.Warn("unrecognised status mode, falling back to the default", "value", cfg.StatusMode, "using", defaults.StatusMode)
 		}
 	}
-	return &Bridge{
+	resolved := cfg.withDefaults()
+	var gate chatgate.Classifier = resolved.ReplyGate
+	if resolved.ReplyGateMode != "off" && gate == nil {
+		gate = chatgate.New(resolved.ReplyGateEndpoint, resolved.ReplyGateModel, resolved.ReplyGateTimeout)
+	}
+	b := &Bridge{
 		chat:      chat,
 		gw:        gw,
-		cfg:       cfg.withDefaults(),
+		cfg:       resolved,
 		log:       log,
 		seen:      map[string]struct{}{},
 		watches:   map[string]*watch{},
 		delivered: map[string]bool{},
+		summaries: map[string]string{},
+		gate:      gate,
 	}
+	if warmer, ok := gate.(interface{ Warm(context.Context) error }); ok {
+		go func() {
+			if err := warmer.Warm(context.Background()); err != nil {
+				log.Warn("reply gate warm-up failed", "err", err)
+			} else {
+				log.Info("reply gate warm")
+			}
+		}()
+	}
+	return b
 }
 
 // canonicalTurn answers "which gateway turn carries this prompt's reply". Normally it is the id we sent;
@@ -340,6 +383,10 @@ func (b *Bridge) onMessage(ctx context.Context, ev *chatmsg.Event) error {
 	}
 
 	prompt := ev.Prompt()
+	replyThread, suppress := b.replyGate(ctx, ev, prompt)
+	if suppress {
+		return nil
+	}
 	if b.cfg.PrefixWithSender {
 		prompt = fmt.Sprintf("%s <%s>: %s", ev.Who(), ev.UserEmail, prompt)
 	}
@@ -375,18 +422,106 @@ func (b *Bridge) onMessage(ctx context.Context, ev *chatmsg.Event) error {
 	if resp.Folded {
 		b.log.Info("prompt folded into the run already going", "prompt", turnID, "turn", canonicalTurn(resp, turnID))
 	}
-	b.track(ctx, turnID, canonicalTurn(resp, turnID), ev)
+	b.trackThread(ctx, turnID, canonicalTurn(resp, turnID), ev, replyThread)
 	return nil
+}
+
+// replyGate decides whether an untagged message should reach Pi and which Chat thread should receive
+// it. Dry-run deliberately returns today's route and never suppresses a prompt.
+func (b *Bridge) replyGate(ctx context.Context, ev *chatmsg.Event, message string) (string, bool) {
+	replyThread := ev.Thread
+	if b.gate == nil || b.cfg.ReplyGateMode == "off" || ev.Mentioned {
+		return replyThread, false
+	}
+	flow := chatgate.FlowShouldRespond
+	if ev.DM {
+		flow = chatgate.FlowThreadRequest
+	}
+	started := time.Now()
+	summary := b.summaryFor(ev.Thread)
+	if !ev.DM {
+		if answer, _, _, err := b.gate.Classify(ctx, chatgate.FlowSummary, summary, ev.Who(), message); err == nil {
+			summary = summaryWords(answer)
+			b.setSummary(ev.Thread, summary)
+		}
+	}
+	answer, prompt, _, err := b.gate.Classify(ctx, flow, summary, ev.Who(), message)
+	action := "dry-run-forward"
+	if err != nil {
+		if ev.DM {
+			action = "fallback-inline"
+		} else {
+			action = "fallback-silent"
+		}
+	} else if strings.EqualFold(firstWord(answer), "NO") && !ev.DM {
+		action = "suppress"
+	} else if ev.DM && strings.EqualFold(firstWord(answer), "THREAD") {
+		action = "thread"
+	} else if ev.DM {
+		action = "inline"
+	} else {
+		action = "forward"
+	}
+	decision := action
+	loggedAction := action
+	if b.cfg.ReplyGateMode == "dry-run" {
+		loggedAction = "dry-run-" + action
+	}
+	b.log.Info("reply gate", "thread", ev.Thread, "flow", flow, "prompt", prompt, "answer", answer, "latency_ms", time.Since(started).Milliseconds(), "action", loggedAction)
+	if b.cfg.ReplyGateMode == "enforce" {
+		switch decision {
+		case "suppress", "fallback-silent":
+			return replyThread, true
+		case "thread":
+			// ev.Thread is the DM's synthetic space thread. Empty means create a new Chat thread.
+			replyThread = ""
+		case "inline", "fallback-inline":
+			// Keep the existing DM route: the bridge treats the DM space as its inline thread.
+		}
+	}
+	return replyThread, false
+}
+
+func (b *Bridge) summaryFor(thread string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.summaries[thread]
+}
+
+func (b *Bridge) setSummary(thread, summary string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.summaries[thread] = summary
+}
+
+func summaryWords(value string) string {
+	words := strings.Fields(strings.TrimSpace(value))
+	if len(words) > 30 {
+		words = words[:30]
+	}
+	return strings.Join(words, " ")
+}
+
+func firstWord(value string) string {
+	words := strings.Fields(value)
+	if len(words) == 0 {
+		return ""
+	}
+	return words[0]
 }
 
 // track registers a turn and starts the goroutine that turns it into Chat messages. base is the
 // caller's context (the Pub/Sub receive context), which is what cancels a watch on shutdown.
 func (b *Bridge) track(base context.Context, promptID, turnID string, ev *chatmsg.Event) {
+	b.trackThread(base, promptID, turnID, ev, ev.Thread)
+}
+
+func (b *Bridge) trackThread(base context.Context, promptID, turnID string, ev *chatmsg.Event, replyThread string) {
 	w := &watch{
 		promptID: promptID,
 		turnID:   turnID,
 		space:    ev.Space,
-		thread:   ev.Thread,
+		thread:   replyThread,
 		replyID:  clientID("reply-" + promptID),
 		statusID: clientID("status-" + promptID),
 	}

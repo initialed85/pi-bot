@@ -86,6 +86,25 @@ gateway's state so a restart can tell whether Pi is reachable and busy. Full env
 `PI_CHAT_ALLOWLIST` is closed by default — an empty allowlist denies everyone, and an unmentioned
 message in a shared room is ignored. A bot that answers strangers tells them the door is here.
 
+## Optional reply gate
+
+The bridge includes a small-model reply gate for untagged messages. It is **dry-run by default**:
+it calls the OpenAI-compatible classifier, logs one structured `reply gate` decision per gated message,
+and preserves the existing Chat behaviour. It never gates `@pi-chat` messages.
+
+```bash
+PI_CHAT_REPLY_GATE_MODE=dry-run       # off | dry-run | enforce (application default: dry-run)
+PI_CHAT_REPLY_GATE_URL=https://sentiment-analyzer.dev.initialed85.cc
+PI_CHAT_REPLY_GATE_MODEL=unsloth/gemma-4-E4B-it-GGUF:IQ4_XS
+PI_CHAT_REPLY_GATE_TIMEOUT_SECONDS=2
+```
+
+In `enforce` mode, direct messages can be routed inline or into a new thread, and untagged messages
+inside a group thread can be suppressed. Classifier failures fall back to inline DMs and silence
+untagged group-thread messages. Do not enable `enforce` until dry-run logs have been reviewed.
+The prompts are embedded under `internal/chatgate/prompts/` and are intentionally kept identical to
+the evaluated prompts in the companion `pi-bot` package.
+
 ## Layout
 
 ```

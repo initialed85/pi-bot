@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/initialed85/pi-bot/internal/chatapi"
+	"github.com/initialed85/pi-bot/internal/chatgate"
 	"github.com/initialed85/pi-bot/internal/chatmsg"
 	"github.com/initialed85/pi-bot/internal/gateway"
 )
@@ -1121,5 +1122,126 @@ func TestFinalText_RejectsLeakedToolCallMarkup(t *testing.T) {
 	// An aborted turn whose only text was scaffolding still reports the stop cleanly.
 	if stopped := finalText(gateway.Turn{Status: "aborted", Text: leaked, AnswerRejected: leaked}); stopped != "⏹ Stopped." {
 		t.Fatalf("aborted turn leaked scaffolding: %q", stopped)
+	}
+}
+
+type gateCall struct {
+	flow, summary, sender, message string
+}
+
+type fakeGate struct {
+	mu      sync.Mutex
+	answers map[string]string
+	errs    map[string]error
+	calls   []gateCall
+}
+
+func (g *fakeGate) Classify(_ context.Context, flow, summary, sender, message string) (string, string, time.Duration, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.calls = append(g.calls, gateCall{flow: flow, summary: summary, sender: sender, message: message})
+	if err := g.errs[flow]; err != nil {
+		return "", "", 0, err
+	}
+	return g.answers[flow], "prompt:" + flow, 0, nil
+}
+
+func (g *fakeGate) callsFor(flow string) []gateCall {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	var out []gateCall
+	for _, call := range g.calls {
+		if call.flow == flow {
+			out = append(out, call)
+		}
+	}
+	return out
+}
+
+func gateEvent(dm, mentioned bool) *chatmsg.Event {
+	return &chatmsg.Event{
+		Kind: chatmsg.KindMessage, Space: "spaces/test", Thread: "spaces/test/threads/thread-1",
+		SpaceType: "ROOM", DM: dm, Mentioned: mentioned, UserEmail: "owner@example.com",
+		UserDisplayName: "Owner", Text: "hello", Argument: "hello", MessageName: "spaces/test/messages/m1.m1",
+	}
+}
+
+func TestReplyGate_DMThreadAndInlineRouting(t *testing.T) {
+	for _, test := range []struct {
+		name, answer, wantThread string
+	}{
+		{name: "thread", answer: "THREAD", wantThread: ""},
+		{name: "inline", answer: "INLINE", wantThread: "spaces/test/threads/thread-1"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			gate := &fakeGate{answers: map[string]string{chatgate.FlowThreadRequest: test.answer}, errs: map[string]error{}}
+			b := New(&fakeChat{}, &fakeGateway{}, Config{ReplyGateMode: "enforce", ReplyGate: gate}, nil)
+			got, suppress := b.replyGate(context.Background(), gateEvent(true, false), "hello")
+			if suppress || got != test.wantThread {
+				t.Fatalf("route=%q suppress=%v, want route=%q", got, suppress, test.wantThread)
+			}
+			if len(gate.callsFor(chatgate.FlowThreadRequest)) != 1 {
+				t.Fatalf("calls=%v", gate.calls)
+			}
+		})
+	}
+}
+
+func TestReplyGate_MentionBypassesAndDryRunDoesNotChangeRouting(t *testing.T) {
+	gate := &fakeGate{answers: map[string]string{chatgate.FlowThreadRequest: "THREAD"}, errs: map[string]error{}}
+	b := New(&fakeChat{}, &fakeGateway{}, Config{ReplyGateMode: "enforce", ReplyGate: gate}, nil)
+	got, suppress := b.replyGate(context.Background(), gateEvent(true, true), "hello")
+	if suppress || got != "spaces/test/threads/thread-1" || len(gate.calls) != 0 {
+		t.Fatalf("mention should bypass gate: route=%q suppress=%v calls=%d", got, suppress, len(gate.calls))
+	}
+
+	dryGate := &fakeGate{answers: map[string]string{chatgate.FlowThreadRequest: "THREAD"}, errs: map[string]error{}}
+	dry := New(&fakeChat{}, &fakeGateway{}, Config{ReplyGateMode: "dry-run", ReplyGate: dryGate}, nil)
+	got, suppress = dry.replyGate(context.Background(), gateEvent(true, false), "hello")
+	if suppress || got != "spaces/test/threads/thread-1" {
+		t.Fatalf("dry-run changed today's route: route=%q suppress=%v", got, suppress)
+	}
+}
+
+func TestReplyGate_ThreadSuppressionStillUpdatesSummary(t *testing.T) {
+	gate := &fakeGate{answers: map[string]string{
+		chatgate.FlowSummary:       "weather tomorrow remains the open question",
+		chatgate.FlowShouldRespond: "NO",
+	}, errs: map[string]error{}}
+	cfg := Config{ReplyGateMode: "enforce", ReplyGate: gate, RequireMentionInRooms: false}
+	b := New(&fakeChat{}, &fakeGateway{}, cfg, nil)
+	got, suppress := b.replyGate(context.Background(), gateEvent(false, false), "mum says she'll bring the esky")
+	if !suppress || got == "" {
+		t.Fatalf("expected silent suppression in thread, route=%q suppress=%v", got, suppress)
+	}
+	if gotSummary := b.summaryFor("spaces/test/threads/thread-1"); gotSummary != "weather tomorrow remains the open question" {
+		t.Fatalf("summary=%q", gotSummary)
+	}
+	if calls := gate.callsFor(chatgate.FlowShouldRespond); len(calls) != 1 || calls[0].summary == "" {
+		t.Fatalf("should-respond did not receive running summary: %+v", calls)
+	}
+}
+
+func TestReplyGate_Fallbacks(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		dm           bool
+		wantSuppress bool
+		wantThread   string
+	}{
+		{name: "dm classifier failure", dm: true, wantThread: "spaces/test/threads/thread-1"},
+		{name: "thread classifier failure", dm: false, wantSuppress: true, wantThread: "spaces/test/threads/thread-1"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			gate := &fakeGate{answers: map[string]string{}, errs: map[string]error{
+				chatgate.FlowThreadRequest: fmt.Errorf("timeout"),
+				chatgate.FlowShouldRespond: fmt.Errorf("HTTP 503"),
+			}}
+			b := New(&fakeChat{}, &fakeGateway{}, Config{ReplyGateMode: "enforce", ReplyGate: gate, RequireMentionInRooms: false}, nil)
+			got, suppress := b.replyGate(context.Background(), gateEvent(test.dm, false), "hello")
+			if suppress != test.wantSuppress || got != test.wantThread {
+				t.Fatalf("route=%q suppress=%v, want route=%q suppress=%v", got, suppress, test.wantThread, test.wantSuppress)
+			}
+		})
 	}
 }
