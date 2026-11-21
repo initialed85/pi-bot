@@ -72,9 +72,13 @@ func (c *Client) Post(ctx context.Context, text string, opts PostOpts) (*Message
 	if opts.ClientID != "" {
 		call = call.MessageId(opts.ClientID)
 	}
-	// REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD keeps the answer in the thread the question came from and
-	// quietly starts one where threading is unsupported, instead of failing the post.
-	call = call.MessageReplyOption("REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD")
+	// A thread target needs the fallback option so Chat can reply to it or start one. For a plain
+	// top-level post (notably the ADDED_TO_SPACE greeting), omit messageReplyOption entirely: sending
+	// REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD without a thread makes Chat reject the request with
+	// "The request does not specify which message to reply to."
+	if option := replyOption(opts.Thread); option != "" {
+		call = call.MessageReplyOption(option)
+	}
 	created, err := call.Context(ctx).Do()
 	if err != nil {
 		return nil, fmt.Errorf("chatapi: post to %s: %w", opts.Space, err)
@@ -208,6 +212,13 @@ func ResolveResource(ref string) (string, error) {
 		return "", fmt.Errorf("chatapi: decode attachment ref: %w", err)
 	}
 	return string(raw), nil
+}
+
+func replyOption(thread string) string {
+	if thread != "" {
+		return "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
+	}
+	return ""
 }
 
 func firstOf(values ...string) string {
