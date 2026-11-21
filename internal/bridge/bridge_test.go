@@ -1266,3 +1266,32 @@ func TestReplyGate_Fallbacks(t *testing.T) {
 		})
 	}
 }
+
+func TestGroupTopLevelGateIsHardAndTaggedThreadsRemainEligible(t *testing.T) {
+	gate := &fakeGate{answers: map[string]string{
+		chatgate.FlowSummary:       "a thread topic",
+		chatgate.FlowShouldRespond: "YES",
+	}, errs: map[string]error{}}
+	b := New(&fakeChat{}, &fakeGateway{}, Config{ReplyGateMode: "dry-run", ReplyGate: gate, RequireMentionInRooms: false}, nil)
+	outside := gateEvent(false, false)
+	if b.groupMessageEligible(outside) {
+		t.Fatal("new group thread was pre-authorized")
+	}
+	// The hard top-level rule is checked before replyGate, so this path must not call the model.
+	if b.groupMessageEligible(outside) || len(gate.calls) != 0 {
+		t.Fatalf("untagged top-level message was not ignored: calls=%v", gate.calls)
+	}
+
+	tagged := gateEvent(false, true)
+	b.markPiThread(tagged.Thread)
+	followUp := gateEvent(false, false)
+	if !b.groupMessageEligible(followUp) {
+		t.Fatal("tagged thread was not recorded")
+	}
+	if _, suppress := b.replyGate(context.Background(), followUp, followUp.Prompt()); suppress {
+		t.Fatal("eligible untagged thread was suppressed in dry-run")
+	}
+	if len(gate.callsFor(chatgate.FlowShouldRespond)) != 1 {
+		t.Fatalf("eligible thread did not reach should-respond: %+v", gate.calls)
+	}
+}

@@ -52,8 +52,9 @@ type Config struct {
 	// Allowlist is the set of sender emails permitted to drive Pi. Empty means deny everything: the
 	// bot is reachable by anyone Google lets add it to a space, so the default is closed.
 	Allowlist []string
-	// RequireMentionInRooms drops room messages that do not mention the app. Without it every message
-	// in a shared space becomes a prompt.
+	// RequireMentionInRooms is retained for config compatibility. Group top-level messages are now
+	// always ignored unless they mention the app; untagged follow-ups are gated only inside a thread
+	// where the app was previously mentioned.
 	RequireMentionInRooms bool
 	// StatusMode decides what happens to the status bubble a turn gets:
 	//   "patch" (default)  - the bubble is rewritten in place, so one message carries 👀 -> 🤔 ->
@@ -188,9 +189,10 @@ type Bridge struct {
 	mu        sync.Mutex
 	seen      map[string]struct{}
 	seenQ     []string
-	watches   map[string]*watch // space -> in-flight watch, so /stop can reach it
-	delivered map[string]bool   // gateway turn id -> its answer has already been posted
-	summaries map[string]string // thread -> <=30-word running summary for the reply gate
+	watches   map[string]*watch   // space -> in-flight watch, so /stop can reach it
+	delivered map[string]bool     // gateway turn id -> its answer has already been posted
+	summaries map[string]string   // thread -> <=30-word running summary for the reply gate
+	piThreads map[string]struct{} // group threads where a message mentioned the app
 	gate      chatgate.Classifier
 	lastSpace string
 	watchers  sync.WaitGroup
@@ -234,6 +236,7 @@ func New(chat Chat, gw Gateway, cfg Config, log *slog.Logger) *Bridge {
 		watches:   map[string]*watch{},
 		delivered: map[string]bool{},
 		summaries: map[string]string{},
+		piThreads: map[string]struct{}{},
 		gate:      gate,
 	}
 	if warmer, ok := gate.(interface{ Warm(context.Context) error }); ok {
@@ -369,8 +372,11 @@ func (b *Bridge) onMessage(ctx context.Context, ev *chatmsg.Event) error {
 		// Deliberately silent: a bot that answers strangers tells them the door is here.
 		return nil
 	}
-	if b.cfg.RequireMentionInRooms && !ev.DM && !ev.Mentioned && ev.SpaceType != "DM" {
-		b.log.Info("room message without mention; ignoring", "space", ev.Space)
+	if !ev.DM && ev.Mentioned {
+		b.markPiThread(ev.Thread)
+	}
+	if !b.groupMessageEligible(ev) {
+		b.log.Info("group message outside a pi-chat thread; ignoring", "space", ev.Space, "thread", ev.Thread)
 		return nil
 	}
 	if ev.Prompt() == "" && len(ev.Attachments) == 0 {
@@ -485,6 +491,26 @@ func (b *Bridge) replyGate(ctx context.Context, ev *chatmsg.Event, message strin
 		}
 	}
 	return replyThread, false
+}
+
+func (b *Bridge) groupMessageEligible(ev *chatmsg.Event) bool {
+	return ev.DM || ev.Mentioned || b.isPiThread(ev.Thread)
+}
+
+func (b *Bridge) markPiThread(thread string) {
+	if thread == "" {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.piThreads[thread] = struct{}{}
+}
+
+func (b *Bridge) isPiThread(thread string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	_, ok := b.piThreads[thread]
+	return ok
 }
 
 func (b *Bridge) summaryFor(thread string) string {

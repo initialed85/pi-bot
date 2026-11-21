@@ -30,7 +30,6 @@
 //	PI_CHAT_MAX_WAIT_MINUTES   give up watching after this (default 30)
 //	PI_CHAT_IMAGE_MAX_MB       per-attachment download cap (default 4)
 //	PI_CHAT_MAX_IMAGES         attachments forwarded per message (default 4)
-//	PI_CHAT_ALLOW_ANY_ROOM_MESSAGE  set to 1 to treat unmentioned room messages as prompts
 //	PI_CHAT_REPLY_GATE_MODE    off|dry-run|enforce (default off; dry-run logs, enforce suppresses/reroutes)
 //	PI_CHAT_REPLY_GATE_URL     OpenAI-compatible gate endpoint (default sentiment-analyzer.dev...)
 //	PI_CHAT_REPLY_GATE_MODEL   gate model name
@@ -264,9 +263,6 @@ func loadSettings() (settings, error) {
 	}
 
 	s.cfg.Allowlist = s.allowlist
-	if one("PI_CHAT_ALLOW_ANY_ROOM_MESSAGE") {
-		s.cfg.RequireMentionInRooms = false
-	}
 	if one("PI_CHAT_NO_SENDER_PREFIX") {
 		s.cfg.PrefixWithSender = false
 	}
