@@ -61,6 +61,18 @@ Bridge integration contract (for build-google-chat-bot):
   the small model warm so timeouts stay rare.
 - Rollout: dry-run flag first (log decisions, suppress nothing), then enforce.
 
+## Running the batches without freezing the chat
+
+pi-chat is backed by ONE pi session, and that session is also the thing answering these evals. A
+synchronous `node eval.mjs` run holds the turn for minutes (22-38 classifier calls), so any Chat message
+that arrives waits for the whole batch: on 2026-11-21 a 20-minute eval loop delayed Ed's message by
+~43 minutes and the bridge had to keep polling a turn that had not started. While Chat is live, run
+batches detached and end the turn:
+
+    nohup node eval.mjs should-respond > /tmp/eval-sr.log 2>&1 &
+
+Then read `/tmp/eval-sr.log` in a later turn. `eval-real.mjs` takes several minutes for the same reason.
+
 ## Reviewing live decisions
 
 `gate-logs.mjs` renders the deployed bridge's dry-run decisions as a table, plus the
