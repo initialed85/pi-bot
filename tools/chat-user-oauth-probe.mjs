@@ -85,9 +85,14 @@ async function exchange(client, code) {
   });
   const j = await r.json();
   if (!j.refresh_token) throw new Error("token exchange failed: " + JSON.stringify(j).slice(0, 300));
-  fs.writeFileSync(TOKEN_PATH, JSON.stringify({ refresh_token: j.refresh_token, scope: j.scope }, null, 2), {
-    mode: 0o600,
-  });
+  fs.writeFileSync(
+    TOKEN_PATH,
+    JSON.stringify({ refresh_token: j.refresh_token, scope: j.scope, obtainedAt: new Date().toISOString() }, null, 2),
+    { mode: 0o600 },
+  );
+  // The granted scope is part of the report the transport owner needs: a scope Google silently
+  // dropped from consent changes what a later 403 means.
+  console.log("granted scope: " + (j.scope || "(not returned)"));
   console.log(`refresh token written to ${TOKEN_PATH} (0600). Do not paste it into Chat.`);
   return j.refresh_token;
 }
@@ -105,13 +110,13 @@ async function accessToken(client, refreshToken) {
   });
   const j = await r.json();
   if (!j.access_token) throw new Error("refresh failed: " + JSON.stringify(j).slice(0, 300));
-  return j.access_token;
+  return j;
 }
 
 async function get(token, url) {
   const r = await fetch(url, { headers: { authorization: "Bearer " + token } });
   const t = await r.text();
-  return { status: r.status, body: t.replace(/\s+/g, " ").slice(0, 400) };
+  return { status: r.status, statusText: r.statusText, body: t.replace(/\s+/g, " ").slice(0, 400) };
 }
 
 const EVENTS_FILTER = 'eventTypes:"google.workspace.chat.message.v1.created"';
@@ -137,7 +142,12 @@ async function main() {
     refreshToken = await exchange(client, await waitForCode());
   }
 
-  const token = await accessToken(client, refreshToken);
+  const at = await accessToken(client, refreshToken);
+  const token = at.access_token;
+  console.log("\nrequested scopes: " + SCOPES.join(", "));
+  console.log("scope on this access token: " + (at.scope || "(not returned by Google)"));
+  console.log("consent mode hint: " + (at.expires_in ? "token issued; expires_in=" + at.expires_in : "token issued"));
+  if (fs.existsSync(TOKEN_PATH)) console.log("scope recorded at consent: " + (readJson(TOKEN_PATH).scope || "(none)"));
   const who = await get(token, "https://chat.googleapis.com/v1/spaces?pageSize=25");
   const seen = [...new Set((who.body.match(/spaces\/[A-Za-z0-9]+/g) || []))];
   report("spaces.list (user auth)", who);
@@ -181,8 +191,9 @@ Read this way:
 
 function report(label, r) {
   const mark = r.status === 200 ? "OK  " : `${r.status}`;
-  console.log(`\n[${mark}] ${label}`);
-  console.log("     " + r.body.slice(0, 260));
+  // Full error status/detail matters to the transport owner, so keep the reason phrase too.
+  console.log(`\n[${mark}] ${label}${r.status === 200 ? "" : " (" + (r.statusText || "") + ")"}`);
+  console.log("     " + r.body.slice(0, 400));
 }
 
 main().catch((e) => {
