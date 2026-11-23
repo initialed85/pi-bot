@@ -108,6 +108,13 @@ currently has no way to run in a room at all:
    is therefore in-process only, and a roll makes pi-chat forget the threads it was tagged
    into, whose untagged follow-ups then get ignored without a model call.
 
+The one route that might unblock room traffic without a paid Workspace organization is
+*user* authorisation instead of the app credential - Google lists user auth as supported for
+space event subscriptions, and every refusal so far came from the app credential. Probe it with
+`tools/chat-user-oauth-probe.mjs` (runs on a laptop, needs an OAuth client + one consent click).
+If it returns 200s where the app gets 403/500, room-wide listening becomes technically possible
+but means the bot reads the room as Ed, which is a disclosure decision before it is a feature.
+
 Consequence for any review: **an empty decision table in enforce is the expected result, not
 evidence the gate is well-behaved.** "No suppressions" today means "the gate was never
 consulted", so group behaviour must be judged from offline eval (`eval.mjs`, `eval-real.mjs`)
