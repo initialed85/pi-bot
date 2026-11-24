@@ -162,11 +162,52 @@ async function ensureTopic(token, client) {
   const url = `https://pubsub.googleapis.com/v1/projects/${TOPIC_PROJECT}/topics/${TOPIC}`;
   const r = await fetch(url, { method: "PUT", headers: { authorization: "Bearer " + token, "content-type": "application/json" }, body: "{}" });
   const t = (await r.text()).replace(/\s+/g, " ").slice(0, 300);
-  console.log(`\n[${r.status}] pubsub PUT topics/${TOPIC} (create if missing)`);
+  // Idempotent means idempotent: PUT on an existing topic is 409, and that is the normal second run.
+  const status = r.status === 409 ? 200 : r.status;
+  console.log(`\n[${r.status === 409 ? "OK  (already existed)" : r.status}] pubsub PUT topics/${TOPIC} (create if missing)`);
   console.log("     " + t);
-  if (!r.ok) throw new Error("topic creation refused: " + t.slice(0, 200));
+  if (status !== 200) throw new Error("topic creation refused: " + t.slice(0, 200));
   console.log("     topic exists. Pub/Sub bills throughput only, first 10 GiB/month free; an idle topic costs nothing.");
   void client;
+}
+
+/**
+ * The grant Google's own refusal asks for. Without it a subscription attempt fails with a 400 that
+ * reads like a topic problem but is really an IAM problem:
+ *   "You don't have permission to access Pub/Sub topic ... or the topic doesn't exist. Check that
+ *    your Pub/Sub topic belongs to the same Google Cloud project of your app and that you've granted
+ *    Google Workspace access to publish messages to the Pub/Sub topic."
+ * The events docs name the principal for Chat events as chat-api-push@system.gserviceaccount.com,
+ * role roles/pubsub.publisher. Read-modify-write on the topic policy so an existing binding (the
+ * bridge's own) is preserved, and the live topic is refused for the same reason as above.
+ */
+async function grantChatPushPublisher(token) {
+  if (TOPIC === LIVE_TOPIC) {
+    console.log(`\nrefusing to grant publish rights on ${TOPIC}: that topic feeds the live gate.`);
+    process.exit(2);
+  }
+  const name = `projects/${TOPIC_PROJECT}/topics/${TOPIC}`;
+  const getR = await fetch(`https://pubsub.googleapis.com/v1/${name}:getIamPolicy`, { headers: { authorization: "Bearer " + token } });
+  if (!getR.ok) { console.log(`\n[${getR.status}] pubsub getIamPolicy ${name} (cannot read the policy to modify it safely)`); return; }
+  const policy = await getR.json();
+  const bindings = policy.bindings ?? [];
+  const member = "serviceAccount:chat-api-push@system.gserviceaccount.com";
+  const existing = bindings.find((b) => b.role === "roles/pubsub.publisher");
+  if (existing?.bindings?.some((b) => b.member === member)) {
+    console.log("\nchat-api-push already has roles/pubsub.publisher on this topic; nothing to change.");
+    return;
+  }
+  if (existing) existing.bindings.push({ member, role: "roles/pubsub.publisher" });
+  else bindings.push({ role: "roles/pubsub.publisher", members: [member] });
+  const setR = await fetch(`https://pubsub.googleapis.com/v1/${name}:setIamPolicy`, {
+    method: "POST",
+    headers: { authorization: "Bearer " + token, "content-type": "application/json" },
+    body: JSON.stringify({ policy: { ...policy, bindings } }),
+  });
+  const t = (await setR.text()).replace(/\s+/g, " ").slice(0, 400);
+  console.log(`\n[${setR.status}] pubsub setIamPolicy ${name} -> add ${member} as roles/pubsub.publisher`);
+  console.log("     " + t);
+  if (setR.ok) console.log("     granted. The events docs warn it can take a few minutes to take effect.");
 }
 
 const EVENTS_FILTER = 'eventTypes:"google.workspace.chat.message.v1.created"';
@@ -194,7 +235,10 @@ async function main() {
 
   const at = await accessToken(client, refreshToken);
   const token = at.access_token;
-  if (TOPIC) await ensureTopic(token, client);
+  if (TOPIC) {
+    await ensureTopic(token, client);
+    await grantChatPushPublisher(token);
+  }
   console.log("\nrequested scopes: " + SCOPES.join(", "));
   console.log("scope on this access token: " + (at.scope || "(not returned by Google)"));
   console.log("consent mode hint: " + (at.expires_in ? "token issued; expires_in=" + at.expires_in : "token issued"));
@@ -224,8 +268,11 @@ async function main() {
     };
     if (TOPIC) sub.notificationEndpoint = { pubsubTopic: `projects/${TOPIC_PROJECT}/topics/${TOPIC}` };
     const verb = CREATE ? "create (REAL - delivers events to the named topic)" : "validateOnly";
+    // There is no `parent` parameter for subscriptions.create. The earlier attempt failed with
+    // "Unknown name parent: Cannot bind query parameter", which is a shape error, not a refusal to
+    // let a consumer account subscribe. The subscription resource goes in the body, flat.
     const we = await fetch(
-      `https://workspaceevents.googleapis.com/v1/subscriptions?parent=projects/${TOPIC_PROJECT}` + (CREATE ? "" : "&validateOnly=true"),
+      `https://workspaceevents.googleapis.com/v1/subscriptions` + (CREATE ? "" : "?validateOnly=true"),
       {
         method: "POST",
         headers: { authorization: "Bearer " + token, "content-type": "application/json" },
