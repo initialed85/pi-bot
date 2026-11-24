@@ -60,10 +60,9 @@ const CREATE = args.includes("--create-subscription");
 const SCOPES = [
   "https://www.googleapis.com/auth/chat.messages.readonly",
   "https://www.googleapis.com/auth/chat.spaces.readonly",
-  // The events API is a different service and needs its own scope.
-  "https://www.googleapis.com/auth/workspaceevents",
-  // Only used by --ensure-topic, so the probe can stand up its own throwaway topic instead of
-  // needing the console or a credential that has no business touching this project's other topics.
+  // The events API has NO scope of its own. Google refused the whole consent request with
+  // invalid_scope, invalid=[.../workspaceevents], and subscriptions.create documents that it is
+  // authorised by the chat.* scopes above. So the Chat scopes do double duty: read and subscribe.
   "https://www.googleapis.com/auth/pubsub",
 ];
 
