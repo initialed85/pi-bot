@@ -193,12 +193,21 @@ async function grantChatPushPublisher(token) {
   const bindings = policy.bindings ?? [];
   const member = "serviceAccount:chat-api-push@system.gserviceaccount.com";
   const existing = bindings.find((b) => b.role === "roles/pubsub.publisher");
-  if (existing?.bindings?.some((b) => b.member === member)) {
+  // Pub/Sub hands back either the simple form ({role, members:[...]}) or the conditional form
+  // ({role, bindings:[{member, role}]}). Checking only one of them used to crash the grant on a
+  // topic that already had the binding, which is the normal second run.
+  const already =
+    existing?.members?.includes(member) ||
+    existing?.bindings?.some((b) => b.member === member);
+  if (already) {
     console.log("\nchat-api-push already has roles/pubsub.publisher on this topic; nothing to change.");
     return;
   }
-  if (existing) existing.bindings.push({ member, role: "roles/pubsub.publisher" });
-  else bindings.push({ role: "roles/pubsub.publisher", members: [member] });
+  if (existing && Array.isArray(existing.bindings)) existing.bindings.push({ member, role: "roles/pubsub.publisher" });
+  else if (existing) {
+    existing.members = existing.members ?? [];
+    existing.members.push(member);
+  } else bindings.push({ role: "roles/pubsub.publisher", members: [member] });
   const setR = await fetch(`https://pubsub.googleapis.com/v1/${name}:setIamPolicy`, {
     method: "POST",
     headers: { authorization: "Bearer " + token, "content-type": "application/json" },
