@@ -8,8 +8,25 @@
 //
 //   node chat-user-oauth-probe.mjs --client ./oauth-client.json
 //   node chat-user-oauth-probe.mjs --client ./oauth-client.json --space spaces/AAQAxKMXxjk
-//   node chat-user-oauth-probe.mjs --client ./oauth-client.json --include-group spaces/AAAA1pNBS1A
+//   node chat-user-oauth-probe.mjs --client ./oauth-client.json --include-group spaces/AAAA1pNBS1A \
+//     --topic pi-chat-probe
+//   node chat-user-oauth-probe.mjs ... --include-group spaces/AAAA1pNBS1A --topic pi-chat-probe --create-subscription
 //
+// What the official docs say as of 2026-11-24 (developers.google.com/workspace/events/guides/events-chat),
+// which is why the verdict has to come from this probe rather than from the earlier refusals:
+//   * A Space subscription accepts USER authentication, and the authorizing user only has to be a
+//     member of the space "through their Google Workspace or Google Account" - a plain consumer
+//     Google Account counts, so a Workspace organization is not required for THIS target resource.
+//   * "All spaces for a user" (//chat.googleapis.com/spaces/-) is user-auth only.
+//   * The Customer target resource is the one that needs an organization, and it demands at least
+//     one Enterprise SKU license plus administrator approval. That route is dead for us.
+//   * Requirements that are ours to satisfy, not Google's to refuse: the project must have billing
+//     enabled, the Workspace Events API and the Chat API must be enabled, and each event type needs
+//     its scope (chat.messages.readonly is a Restricted scope, so an unverified client must be in
+//     testing mode with the user listed as a test user).
+//   * A subscription needs notificationEndpoint.pubsubTopic, so validate-only attempts should still
+//     name a topic that exists. Create a throwaway one: gcloud pubsub topics create pi-chat-probe
+//     Never point it at the bridge's live topic; that would feed real room traffic into the gate.
 // ./oauth-client.json is what you downloaded from the console when you created the OAuth
 // client, or hand-written: {"client_id":"...","client_secret":"..."}
 //
@@ -32,6 +49,11 @@ const REDIRECT = `http://localhost:${PORT}`;
 const TOKEN_PATH = flag("token", "./chat-user-token.json");
 const EXTRA_SPACE = flag("space", null);
 const GROUP = flag("include-group", null);
+// Required for any subscription attempt: Workspace Events rejects a subscription with no
+// notification endpoint, and a validation refusal is not the same answer as an authority refusal.
+const TOPIC_PROJECT = flag("topic-project", "home-ops-513116");
+const TOPIC = flag("topic", null);
+const CREATE = args.includes("--create-subscription");
 
 const SCOPES = [
   "https://www.googleapis.com/auth/chat.messages.readonly",
@@ -165,17 +187,26 @@ async function main() {
       `https://chat.googleapis.com/v1/${sp}/spaceEvents?pageSize=5&filter=${encodeURIComponent(EVENTS_FILTER)}`,
     );
     report("spaces.spaceEvents", ev);
-    const we = await fetch("https://workspaceevents.googleapis.com/v1/subscriptions", {
-      method: "POST",
-      headers: { authorization: "Bearer " + token, "content-type": "application/json" },
-      body: JSON.stringify({
-        targetResource: `//chat.googleapis.com/${sp}`,
-        eventTypes: ["google.workspace.chat.message.v1.created"],
-        payloadOptions: { includeResource: true, fieldMask: "message.name,message.text" },
-        validateOnly: true,
-      }),
-    });
-    console.log(`  workspaceevents validateOnly: ${we.status} ${(await we.text()).replace(/\s+/g, " ").slice(0, 260)}`);
+    // validateOnly is a query parameter on create, not a field of the Subscription resource.
+    const sub = {
+      targetResource: `//chat.googleapis.com/${sp}`,
+      eventTypes: ["google.workspace.chat.message.v1.created"],
+      payloadOptions: { includeResource: true, fieldMask: "message.name,message.text" },
+    };
+    if (TOPIC) sub.notificationEndpoint = { pubsubTopic: `projects/${TOPIC_PROJECT}/topics/${TOPIC}` };
+    const verb = CREATE ? "create (REAL - delivers events to the named topic)" : "validateOnly";
+    const we = await fetch(
+      `https://workspaceevents.googleapis.com/v1/subscriptions?parent=projects/${TOPIC_PROJECT}` + (CREATE ? "" : "&validateOnly=true"),
+      {
+        method: "POST",
+        headers: { authorization: "Bearer " + token, "content-type": "application/json" },
+        body: JSON.stringify(sub),
+      },
+    );
+    const wt = (await we.text()).replace(/\s+/g, " ").slice(0, 400);
+    console.log(`\n[${we.status}] workspaceevents ${verb} on ${sp}${TOPIC ? " -> topics/" + TOPIC : " (no --topic given: expect a validation refusal, which proves nothing about authority)"}`);
+    console.log("     " + wt);
+    if (CREATE && we.ok) console.log("     created for real. Delete it with: DELETE /v1/{name} using this same token, or it keeps delivering until it expires.");
   }
 
   console.log(`
@@ -186,7 +217,12 @@ Read this way:
   * A refusal that still names "Google Workspace organization" or "administrator approval"
     means the user path is closed for a consumer account too, and this whole idea is dead.
   * 403 PERMISSION_DENIED naming a scope means consent did not include it; rerun with
-    --reconsent after adding the scope in the console.`);
+    --reconsent after adding the scope in the console.
+  * A 400 naming notificationEndpoint or the topic means the request shape is wrong or the topic
+    does not exist yet - that says nothing about permission. Pass --topic <an existing topic>.
+  * The answer we are looking for is a 200 on validateOnly with --include-group pointing at the
+    friends room. Anything naming an organization, a licence SKU or administrator approval closes
+    the user route for good.`);
 }
 
 function report(label, r) {
