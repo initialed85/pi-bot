@@ -24,9 +24,11 @@
 //     enabled, the Workspace Events API and the Chat API must be enabled, and each event type needs
 //     its scope (chat.messages.readonly is a Restricted scope, so an unverified client must be in
 //     testing mode with the user listed as a test user).
-//   * A subscription needs notificationEndpoint.pubsubTopic, so validate-only attempts should still
-//     name a topic that exists. Create a throwaway one: gcloud pubsub topics create pi-chat-probe
-//     Never point it at the bridge's live topic; that would feed real room traffic into the gate.
+//   * A subscription needs notificationEndpoint.pubsubTopic, so validate-only attempts still have
+//     to name a topic that exists. --ensure-topic creates a throwaway one with the same user
+//     token (no gcloud, no console). Never point it at the bridge's live topic; that would feed
+//     real room traffic into the gate, so the probe refuses the name rather than trusting the
+//     operator to remember.
 // ./oauth-client.json is what you downloaded from the console when you created the OAuth
 // client, or hand-written: {"client_id":"...","client_secret":"..."}
 //
@@ -60,7 +62,14 @@ const SCOPES = [
   "https://www.googleapis.com/auth/chat.spaces.readonly",
   // The events API is a different service and needs its own scope.
   "https://www.googleapis.com/auth/workspaceevents",
+  // Only used by --ensure-topic, so the probe can stand up its own throwaway topic instead of
+  // needing the console or a credential that has no business touching this project's other topics.
+  "https://www.googleapis.com/auth/pubsub",
 ];
+
+// The bridge's live topic. Pointing a Workspace Events subscription at it would deliver real
+// room traffic into the reply gate before anyone has told the room, so this name is refused.
+const LIVE_TOPIC = flag("live-topic", "pi-chat-events");
 
 function readJson(p) {
   return JSON.parse(fs.readFileSync(p, "utf8"));
@@ -141,6 +150,26 @@ async function get(token, url) {
   return { status: r.status, statusText: r.statusText, body: t.replace(/\s+/g, " ").slice(0, 400) };
 }
 
+/**
+ * Create the throwaway topic if it is missing (idempotent PUT), under the SAME user credential
+ * that creates the subscription. Refuses the bridge's live topic outright: a topic that already
+ * feeds the gate is not a test target, and the subscription would start delivering real messages.
+ */
+async function ensureTopic(token, client) {
+  if (TOPIC === LIVE_TOPIC) {
+    console.log(`\nrefusing --topic ${TOPIC}: that is the bridge's live topic. Pick another name.`);
+    process.exit(2);
+  }
+  const url = `https://pubsub.googleapis.com/v1/projects/${TOPIC_PROJECT}/topics/${TOPIC}`;
+  const r = await fetch(url, { method: "PUT", headers: { authorization: "Bearer " + token, "content-type": "application/json" }, body: "{}" });
+  const t = (await r.text()).replace(/\s+/g, " ").slice(0, 300);
+  console.log(`\n[${r.status}] pubsub PUT topics/${TOPIC} (create if missing)`);
+  console.log("     " + t);
+  if (!r.ok) throw new Error("topic creation refused: " + t.slice(0, 200));
+  console.log("     topic exists. Pub/Sub bills throughput only, first 10 GiB/month free; an idle topic costs nothing.");
+  void client;
+}
+
 const EVENTS_FILTER = 'eventTypes:"google.workspace.chat.message.v1.created"';
 
 async function main() {
@@ -166,6 +195,7 @@ async function main() {
 
   const at = await accessToken(client, refreshToken);
   const token = at.access_token;
+  if (TOPIC) await ensureTopic(token, client);
   console.log("\nrequested scopes: " + SCOPES.join(", "));
   console.log("scope on this access token: " + (at.scope || "(not returned by Google)"));
   console.log("consent mode hint: " + (at.expires_in ? "token issued; expires_in=" + at.expires_in : "token issued"));
