@@ -5,6 +5,7 @@ run against the cheap/fast model at `sentiment-analyzer.dev.initialed85.cc`
 (OpenAI-compatible `/v1/chat/completions`, model `unsloth/gemma-4-E4B-it-GGUF:IQ4_XS`).
 
     node eval.mjs should-respond   # gate: reply to untagged thread message? (YES/NO)
+    node eval.mjs room-respond     # gate: speak up over a new untagged room message at all? (YES/NO)
     node eval.mjs thread-request   # gate: DM wants a thread? (THREAD/INLINE)
     node eval.mjs summary          # running thread summary (<=30 words, merge not append)
 
@@ -15,6 +16,11 @@ per classification, ~1.0-1.5 s per summary update; cold model first call ~1-4 s 
 pod can exceed 15 s - keep the model warm in prod). During the hermes backfill window
 (until 2026-11-22) the same calls measured 3.7-5.1 s with timeouts; do not size the 2 s
 deadline from those numbers.
+
+Baseline added 2026-11-24: room-respond 36/37 (for-bot 12/12, human-to-human 15/16, hard 9/9),
+mean 197 ms. The single miss (rr-20) is a message that wonders about pi-chat *to another person*
+("did it ever tell us why it kept quiet") and answers YES. Room gating is off in the deployed
+config and cannot fire yet: untagged room messages do not arrive over the app credential.
 
 Borderline cases are not reproducible: Gemma at temperature 0 flipped the same input
 between YES and NO on repeat runs while the GGUF server was batching with other traffic.
@@ -29,6 +35,13 @@ Design decisions baked into the prompts:
   the time. The current version keeps 12/12 there but still leaks 2/8 on group-directed questions
   ("anyone got a spare 4090"); every attempt to tighten that traded away replies genuinely aimed at
   pi-chat, so the looser side wins - silence reads as breakage.
+- room-respond is a different question from should-respond: there is no thread and no summary, so the
+  only context it gets is pi-chat's own last answer in that space ("that seems cold, what was it
+  overnight?" is only recognisable as being aimed at the bot if the bot's report is in front of it).
+  Deliberate calls: a question whose addressee is a person in the room ("anyone got a spare 4090",
+  "who's got the house key tonight") is NO even though a bot could field it, and commentary about what
+  pi-chat reported with nothing asked ("hmm that download looks slow") is NO. That second rule was a
+  choice, not a measurement - it labels such commentary as non-invitations in the dataset.
 - thread-request fires ONLY on explicit thread wording; "big/deep/serious topic"
   must not trigger it (the three initial misses were exactly that, now fixed).
 - summary is additive-merge with a hard 30-word cap; unchanged messages pass through.

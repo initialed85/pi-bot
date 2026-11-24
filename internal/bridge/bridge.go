@@ -57,6 +57,12 @@ type Config struct {
 	// always ignored unless they mention the app; untagged follow-ups are gated only inside a thread
 	// where the app was previously mentioned.
 	RequireMentionInRooms bool
+	// GateRoomRootUntagged decides what a new top-level, untagged group message does. False (default)
+	// keeps the historical rule: ignored with no model call. True sends it to the room classifier, which
+	// answers in the thread Chat created for that message only when it judges the message is something
+	// pi-chat is being asked about. It only has effect when ReplyGateMode is enforce (it acts) or dry-run
+	// (the decision is logged and dropped), so a room can be trialled without the trial becoming the noise.
+	GateRoomRootUntagged bool
 	// StatusMode decides what happens to the status bubble a turn gets:
 	//   "patch" (default)  - the bubble is rewritten in place, so one message carries 👀 -> 🤔 ->
 	//                        the answer. Nothing is deleted, which is what Ed asked for after
@@ -118,6 +124,7 @@ func DefaultConfig() Config {
 		MaxChars:              30000,
 		ImageMaxBytes:         4 << 20,
 		MaxImages:             4,
+		GateRoomRootUntagged:  false,
 		RequireMentionInRooms: true,
 		PrefixWithSender:      true,
 		ReplyGateMode:         "off",
@@ -140,7 +147,7 @@ func (c Config) withDefaults() Config {
 		d.StatusMode = DefaultConfig().StatusMode
 	}
 
-	switch strings.ToLower(strings.TrimSpace(d.DeliverAs)) {
+	switch strings.ToLower(strings.TrimSpace(c.DeliverAs)) {
 	case "followup", "queue", "queued":
 		d.DeliverAs = "followUp"
 	case "steer", "fold", "interrupt":
@@ -178,6 +185,9 @@ func (c Config) withDefaults() Config {
 	}
 	d.ReplyGateAttempts = c.ReplyGateAttempts
 	d.ReplyGate = c.ReplyGate
+	// A bool has no sentinel to test against, so it is copied rather than defaulted: leaving it out
+	// silently drops the operator's setting.
+	d.GateRoomRootUntagged = c.GateRoomRootUntagged
 	d.ReplyGateEndpoint = c.ReplyGateEndpoint
 	d.ReplyGateModel = c.ReplyGateModel
 	d.Allowlist = c.Allowlist
@@ -192,16 +202,17 @@ type Bridge struct {
 	cfg  Config
 	log  *slog.Logger
 
-	mu        sync.Mutex
-	seen      map[string]struct{}
-	seenQ     []string
-	watches   map[string]*watch   // space -> in-flight watch, so /stop can reach it
-	delivered map[string]bool     // gateway turn id -> its answer has already been posted
-	summaries map[string]string   // thread -> <=30-word running summary for the reply gate
-	piThreads map[string]struct{} // group threads where a message mentioned the app
-	gate      chatgate.Classifier
-	lastSpace string
-	watchers  sync.WaitGroup
+	mu          sync.Mutex
+	seen        map[string]struct{}
+	seenQ       []string
+	watches     map[string]*watch   // space -> in-flight watch, so /stop can reach it
+	delivered   map[string]bool     // gateway turn id -> its answer has already been posted
+	summaries   map[string]string   // thread -> <=30-word running summary for the reply gate
+	roomAnswers map[string]string   // space -> the last thing pi-chat said there, for the room gate
+	piThreads   map[string]struct{} // group threads where a message mentioned the app
+	gate        chatgate.Classifier
+	lastSpace   string
+	watchers    sync.WaitGroup
 }
 
 type watch struct {
@@ -235,16 +246,17 @@ func New(chat Chat, gw Gateway, cfg Config, log *slog.Logger) *Bridge {
 			WithSchedule(resolved.ReplyGateAttempts...)
 	}
 	b := &Bridge{
-		chat:      chat,
-		gw:        gw,
-		cfg:       resolved,
-		log:       log,
-		seen:      map[string]struct{}{},
-		watches:   map[string]*watch{},
-		delivered: map[string]bool{},
-		summaries: map[string]string{},
-		piThreads: map[string]struct{}{},
-		gate:      gate,
+		chat:        chat,
+		gw:          gw,
+		cfg:         resolved,
+		log:         log,
+		seen:        map[string]struct{}{},
+		watches:     map[string]*watch{},
+		delivered:   map[string]bool{},
+		summaries:   map[string]string{},
+		roomAnswers: map[string]string{},
+		piThreads:   map[string]struct{}{},
+		gate:        gate,
 	}
 	if warmer, ok := gate.(interface{ Warm(context.Context) error }); ok {
 		go func() {
@@ -449,10 +461,16 @@ func (b *Bridge) replyGate(ctx context.Context, ev *chatmsg.Event, message strin
 	flow := chatgate.FlowShouldRespond
 	if ev.DM {
 		flow = chatgate.FlowThreadRequest
+	} else if isTopLevel(ev) {
+		flow = chatgate.FlowRoomRespond
 	}
 	started := time.Now()
 	summary := b.summaryFor(ev.Thread)
-	if !ev.DM {
+	if flow == chatgate.FlowRoomRespond {
+		// A new room message has no thread to summarise. What it does have is whatever pi-chat last said
+		// in this room, which is what "that seems cold, what was it overnight?" is referring to.
+		summary = b.roomAnswerFor(ev.Space)
+	} else if !ev.DM {
 		// The running summary is enrichment, not a decision. It gets its own short deadline so a
 		// slow summary cannot eat the budget the actual respond/ignore call needs.
 		summaryCtx, cancelSummary := context.WithTimeout(ctx, 4*time.Second)
@@ -496,10 +514,21 @@ func (b *Bridge) replyGate(ctx context.Context, ev *chatmsg.Event, message strin
 		loggedAction = "dry-run-" + action
 	}
 	b.log.Info("reply gate", "thread", ev.Thread, "flow", flow, "prompt", prompt, "answer", answer, "latency_ms", time.Since(started).Milliseconds(), "action", loggedAction)
+	if flow == chatgate.FlowRoomRespond && b.cfg.ReplyGateMode != "enforce" {
+		// Dry-run measures the room classifier without putting new text in a shared room: a would-be
+		// room answer is logged and dropped, so reviewing the feature cannot itself be the noise.
+		return replyThread, true
+	}
 	if b.cfg.ReplyGateMode == "enforce" {
 		switch decision {
 		case "suppress", "fallback-suppress":
 			return replyThread, true
+		case "forward":
+			if flow == chatgate.FlowRoomRespond && (replyThread == "" || replyThread == ev.Space) {
+				// Chat normally gives a new room message its own thread, and the answer belongs there, so
+				// the room root stays clean. Only when it did not is the answer a root-level post.
+				replyThread = ""
+			}
 		case "thread":
 			// ev.Thread is the DM's synthetic space thread. Empty means create a new Chat thread.
 			replyThread = ""
@@ -520,9 +549,11 @@ func (b *Bridge) groupMessageEligible(ctx context.Context, ev *chatmsg.Event) bo
 		return !b.cfg.RequireMentionInRooms || ev.SpaceType == "DM"
 	}
 	// A new top-level message is never a continuation, even though Chat gives it a synthetic thread
-	// name. This keeps the hard no-model-call rule for group top-level chatter.
+	// name. Historically that meant no model call at all; with room gating on it reaches the room
+	// classifier instead, which decides whether answering would be an intrusion.
 	if isTopLevel(ev) {
-		return false
+		return b.cfg.GateRoomRootUntagged &&
+			(b.cfg.ReplyGateMode == "enforce" || b.cfg.ReplyGateMode == "dry-run")
 	}
 	if b.isPiThread(ev.Thread) {
 		return true
@@ -583,6 +614,27 @@ func (b *Bridge) setSummary(thread, summary string) {
 	b.summaries[thread] = summary
 }
 
+// roomAnswerFor is what pi-chat last said in this space, as a short quote. The room gate has no thread
+// summary to work from, so this is the only context it gets about what the bot itself has been doing.
+func (b *Bridge) roomAnswerFor(space string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.roomAnswers[space]
+}
+
+func (b *Bridge) noteRoomAnswer(space, text string) {
+	if space == "" || strings.TrimSpace(text) == "" {
+		return
+	}
+	snippet := summaryWords(text)
+	if snippet == "" {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.roomAnswers[space] = "pi-chat just said: " + snippet
+}
+
 func summaryWords(value string) string {
 	words := strings.Fields(strings.TrimSpace(value))
 	if len(words) > 30 {
@@ -602,7 +654,7 @@ func firstWord(value string) string {
 func exactGateToken(answer, flow string) (string, bool) {
 	token := strings.ToUpper(strings.TrimSpace(answer))
 	switch flow {
-	case chatgate.FlowShouldRespond:
+	case chatgate.FlowShouldRespond, chatgate.FlowRoomRespond:
 		return token, token == "YES" || token == "NO"
 	case chatgate.FlowThreadRequest:
 		return token, token == "THREAD" || token == "INLINE"
@@ -822,6 +874,11 @@ func (b *Bridge) deliverAnswer(w *watch, bubble, text string) bool {
 	for i, chunk := range chunks {
 		if i > 0 {
 			chunk = fmt.Sprintf("*(continued %d/%d)*\n\n%s", i+1, len(chunks), chunk)
+		}
+		if i == 0 {
+			// Remember what pi-chat said here: the room gate needs it to tell "that seems cold, what was
+			// it overnight?" (aimed at the bot) from room chatter between people.
+			b.noteRoomAnswer(w.space, text)
 		}
 		// In patch mode the bubble is the answer's first message, which saves a post and keeps one
 		// continuous bubble from eyes to answer.

@@ -1,0 +1,37 @@
+{"id": "rr-01", "split": "for-bot", "sender": "Ed", "message": "what's the weather tomorrow", "label": "YES"}
+{"id": "rr-02", "split": "for-bot", "sender": "Ed", "message": "how long before the sprinklers finish", "label": "YES"}
+{"id": "rr-03", "split": "for-bot", "sender": "Amy", "message": "remind me to call the plumber at 4", "label": "YES"}
+{"id": "rr-04", "split": "for-bot", "sender": "Amy", "message": "check if the dryer is still running", "label": "YES"}
+{"id": "rr-05", "split": "for-bot", "sender": "Ed", "message": "what's on the calendar this week", "label": "YES"}
+{"id": "rr-06", "split": "for-bot", "sender": "Amy", "message": "the kitchen plug is off again", "label": "YES"}
+{"id": "rr-07", "split": "for-bot", "sender": "Ed", "message": "the 6am roster skipped the left bank", "label": "YES"}
+{"id": "rr-08", "split": "for-bot", "sender": "Ed", "message": "did the deploy land", "label": "YES"}
+{"id": "rr-09", "split": "for-bot", "sender": "Ed", "message": "add 12, 18 and 7", "label": "YES"}
+{"id": "rr-10", "split": "for-bot", "sender": "Aaron", "message": "pi-chat how many eggs are left", "label": "YES"}
+{"id": "rr-11", "split": "for-bot", "sender": "Ed", "message": "can you check whether the tradesman turned up today", "label": "YES"}
+{"id": "rr-12", "split": "for-bot", "sender": "Daniel", "message": "are you still running that download", "label": "YES"}
+{"id": "rr-13", "split": "human-to-human", "sender": "Amy", "message": "babe did you order the balloons", "label": "NO"}
+{"id": "rr-14", "split": "human-to-human", "sender": "Aaron", "message": "anyone got a spare 4090", "label": "NO"}
+{"id": "rr-15", "split": "human-to-human", "sender": "Amy", "message": "grab napkins when you're at dodas", "label": "NO"}
+{"id": "rr-16", "split": "human-to-human", "sender": "Ed", "message": "we'll leave at 7 ok", "label": "NO"}
+{"id": "rr-17", "split": "human-to-human", "sender": "Daniel", "message": "lol we eat that much food", "label": "NO"}
+{"id": "rr-18", "split": "human-to-human", "sender": "Ed", "message": "brb taking this call", "label": "NO"}
+{"id": "rr-19", "split": "human-to-human", "sender": "Amy", "message": "yeah they're in the car right now", "label": "NO"}
+{"id": "rr-20", "split": "human-to-human", "sender": "Aaron", "message": "did it ever tell us why it kept quiet", "label": "NO", "summary": "pi-chat just said: the deploy landed at 12:04."}
+{"id": "rr-21", "split": "human-to-human", "sender": "Daniel", "message": "I'm telling you that change is worth the downtime", "label": "NO"}
+{"id": "rr-22", "split": "human-to-human", "sender": "Amy", "message": "who's got the house key tonight", "label": "NO", "summary": "pi-chat just said: the sprinklers finish at 6:36."}
+{"id": "rr-23", "split": "human-to-human", "sender": "Ed", "message": "mum's picking us up at 3", "label": "NO"}
+{"id": "rr-24", "split": "human-to-human", "sender": "Aaron", "message": "gross", "label": "NO"}
+{"id": "rr-25", "split": "human-to-human", "sender": "Amy", "message": "did you get to the chemist", "label": "NO"}
+{"id": "rr-26", "split": "human-to-human", "sender": "Daniel", "message": "yeah exactly, that's what I said", "label": "NO"}
+{"id": "rr-27", "split": "human-to-human", "sender": "Ed", "message": "on my way", "label": "NO"}
+{"id": "rr-28", "split": "hard", "sender": "Amy", "message": "that seems cold, what was it overnight", "label": "YES", "summary": "pi-chat just said: overnight low was 4C and the shed heater ran three times."}
+{"id": "rr-29", "split": "hard", "sender": "Ed", "message": "you missed grandma in that list right", "label": "YES", "summary": "pi-chat just posted a guest list: Sam, Robin, Aaron, Daniel, Amy."}
+{"id": "rr-30", "split": "hard", "sender": "Daniel", "message": "bruh", "label": "NO"}
+{"id": "rr-31", "split": "hard", "sender": "Aaron", "message": "hmm that download looks slow", "label": "NO", "summary": "pi-chat just said: the Xbox download is at 62% and slowing.", "note": "commentary about what pi-chat reported, with nothing asked"}
+{"id": "rr-32", "split": "hard", "sender": "Ed", "message": "nah everything is on dev, that's fine", "label": "NO"}
+{"id": "rr-33", "split": "hard", "sender": "Amy", "message": "sum the numbers in that list I just posted", "label": "YES"}
+{"id": "rr-34", "split": "hard", "sender": "Ed", "message": "im heading out in a bit", "label": "NO"}
+{"id": "rr-35", "split": "hard", "summary": "pi-chat just said: the kitchen plug is on, drawing 3W.", "sender": "Amy", "message": "the kitchen plug is off again", "label": "YES"}
+{"id": "rr-36", "split": "hard", "summary": "pi-chat just said: the roster ran the right bank at 06:00.", "sender": "Ed", "message": "did the left bank run at all", "label": "YES"}
+{"id": "rr-37", "split": "human-to-human", "summary": "pi-chat just said: the sprinklers finish at 6:36.", "sender": "Amy", "message": "did you two eat already", "label": "NO"}

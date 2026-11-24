@@ -16,10 +16,19 @@ import (
 func TestVendoredPromptsMatchPiBotMaster(t *testing.T) {
 	const rawBase = "https://raw.githubusercontent.com/initialed85/pi-bot/master/eval/chat-gate/prompts/"
 	client := &http.Client{Timeout: 10 * time.Second}
-	for _, flow := range []string{FlowShouldRespond, FlowThreadRequest, FlowSummary} {
+	for _, flow := range []string{FlowShouldRespond, FlowRoomRespond, FlowThreadRequest, FlowSummary} {
 		want, err := PromptText(flow)
 		if err != nil {
 			t.Fatal(err)
+		}
+		// The bridge runs the embedded copy, while the build repo vendors the published one under
+		// eval/chat-gate/prompts. Those two must agree inside this repo before anything else is checked.
+		canonical, readLocalErr := os.ReadFile("../../eval/chat-gate/prompts/" + flow + ".md")
+		if readLocalErr != nil {
+			t.Fatalf("published prompt %s is missing from eval/chat-gate/prompts: %v", flow, readLocalErr)
+		}
+		if string(canonical) != want {
+			t.Fatalf("embedded prompt %s differs from the published eval copy; re-vendor or re-run the eval", flow)
 		}
 		res, err := client.Get(rawBase + flow + ".md")
 		if err != nil {
@@ -33,6 +42,12 @@ func TestVendoredPromptsMatchPiBotMaster(t *testing.T) {
 		_ = res.Body.Close()
 		if readErr != nil {
 			t.Fatalf("read upstream %s: %v", flow, readErr)
+		}
+		if res.StatusCode == http.StatusNotFound && string(canonical) == want {
+			// A prompt that exists in both local copies but not yet on master is a change that has not
+			// been pushed, not a silent divergence. Everything else is a hard failure.
+			t.Logf("prompt %s not on master yet; local copies agree", flow)
+			continue
 		}
 		if res.StatusCode != http.StatusOK {
 			t.Fatalf("fetch upstream %s: HTTP %s", flow, res.Status)

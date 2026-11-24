@@ -1170,7 +1170,18 @@ func gateEvent(dm, mentioned bool) *chatmsg.Event {
 	return &chatmsg.Event{
 		Kind: chatmsg.KindMessage, Space: "spaces/test", Thread: "spaces/test/threads/thread-1",
 		SpaceType: "ROOM", DM: dm, Mentioned: mentioned, UserEmail: "owner@example.com",
-		UserDisplayName: "Owner", Text: "hello", Argument: "hello", MessageName: "spaces/test/messages/m1.m1",
+		UserDisplayName: "Owner", Text: "hello", Argument: "hello", MessageName: "spaces/test/messages/m1.thread-1",
+	}
+}
+
+// roomRootEvent is a new top-level message in a shared room: Chat gives it a thread equal to the space
+// and a messageId.messageId name, which is what isTopLevel has to recognise.
+func roomRootEvent() *chatmsg.Event {
+	return &chatmsg.Event{
+		Kind: chatmsg.KindMessage, Space: "spaces/room", Thread: "spaces/room",
+		SpaceType: "ROOM", UserEmail: "owner@example.com", UserDisplayName: "Owner",
+		Text: "what's the weather tomorrow", Argument: "what's the weather tomorrow",
+		MessageName: "spaces/room/messages/root.root",
 	}
 }
 
@@ -1314,6 +1325,128 @@ func TestGroupTopLevelGateIsHardAndTaggedThreadsRemainEligible(t *testing.T) {
 	}
 	if len(gate.callsFor(chatgate.FlowShouldRespond)) != 1 {
 		t.Fatalf("eligible thread did not reach should-respond: %+v", gate.calls)
+	}
+}
+
+func TestRoomRootUntaggedStaysIgnoredWithoutTheFeatureFlag(t *testing.T) {
+	gate := &fakeGate{answers: map[string]string{chatgate.FlowRoomRespond: "YES"}, errs: map[string]error{}}
+	for _, test := range []struct {
+		mode    string
+		mention bool // RequireMentionInRooms: the shipped combination is true.
+	}{
+		{mode: "off", mention: true},
+		{mode: "dry-run"},
+		{mode: "enforce"},
+	} {
+		b := New(&fakeChat{}, &fakeGateway{}, Config{ReplyGateMode: test.mode, ReplyGate: gate, RequireMentionInRooms: test.mention}, nil)
+		if b.groupMessageEligible(context.Background(), roomRootEvent()) {
+			t.Fatalf("mode %s: room gating pre-authorized without the flag", test.mode)
+		}
+	}
+	if len(gate.calls) != 0 {
+		t.Fatalf("default behaviour made model calls: %+v", gate.calls)
+	}
+}
+
+func TestConfigHonoursOperatorValuesThatHaveNoSentinel(t *testing.T) {
+	// DeliverAs and GateRoomRootUntagged are read from the operator's config, not from the pristine
+	// defaults: a pod that sets PI_CHAT_DELIVER_AS=steer must actually steer.
+	steer := New(&fakeChat{}, &fakeGateway{}, Config{DeliverAs: "steer"}, nil)
+	if steer.cfg.DeliverAs != "steer" {
+		t.Fatalf("DeliverAs=%q", steer.cfg.DeliverAs)
+	}
+	if got := New(&fakeChat{}, &fakeGateway{}, Config{DeliverAs: "fold"}, nil).cfg.DeliverAs; got != "steer" {
+		t.Fatalf("DeliverAs alias=%q", got)
+	}
+	if got := New(&fakeChat{}, &fakeGateway{}, Config{DeliverAs: "nonsense"}, nil).cfg.DeliverAs; got != "followUp" {
+		t.Fatalf("unknown DeliverAs=%q, want the default", got)
+	}
+	if got := New(&fakeChat{}, &fakeGateway{}, Config{GateRoomRootUntagged: true}, nil).cfg.GateRoomRootUntagged; !got {
+		t.Fatal("GateRoomRootUntagged was dropped by withDefaults")
+	}
+}
+
+func TestRoomRootGateAnswersInANewThreadAndStaysSilentOnNo(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		thread       string
+		answer       string
+		wantThread   string
+		wantSuppress bool
+	}{
+		// Chat gives a new room message its own thread, and the answer belongs in it so the room root
+		// stays clean. Only when no thread resource came with the event does the answer go root-level.
+		{name: "yes in the message's own thread", thread: "spaces/room/threads/root-thread", answer: "YES", wantThread: "spaces/room/threads/root-thread"},
+		{name: "yes with no thread resource", thread: "spaces/room", answer: "YES", wantThread: ""},
+		{name: "no", thread: "spaces/room/threads/root-thread", answer: "NO", wantThread: "spaces/room/threads/root-thread", wantSuppress: true},
+		{name: "off prompt", thread: "spaces/room/threads/root-thread", answer: "YES probably", wantThread: "spaces/room/threads/root-thread", wantSuppress: true},
+		{name: "classifier failure", thread: "spaces/room/threads/root-thread", answer: "", wantThread: "spaces/room/threads/root-thread", wantSuppress: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			gate := &fakeGate{answers: map[string]string{chatgate.FlowRoomRespond: test.answer}, errs: map[string]error{}}
+			if test.answer == "" {
+				gate.errs[chatgate.FlowRoomRespond] = fmt.Errorf("HTTP 503")
+			}
+			b := New(&fakeChat{}, &fakeGateway{}, Config{
+				ReplyGateMode: "enforce", ReplyGate: gate, RequireMentionInRooms: false,
+				GateRoomRootUntagged: true,
+			}, nil)
+			ev := roomRootEvent()
+			ev.Thread = test.thread
+			if !b.groupMessageEligible(context.Background(), ev) {
+				t.Fatal("room root was not eligible with the flag on")
+			}
+			got, suppress := b.replyGate(context.Background(), ev, ev.Prompt())
+			if suppress != test.wantSuppress || got != test.wantThread {
+				t.Fatalf("route=%q suppress=%v, want route=%q suppress=%v", got, suppress, test.wantThread, test.wantSuppress)
+			}
+			if len(gate.callsFor(chatgate.FlowSummary)) != 0 {
+				t.Fatalf("a room root message has no thread to summarise: %+v", gate.calls)
+			}
+			calls := gate.callsFor(chatgate.FlowRoomRespond)
+			if len(calls) != 1 {
+				t.Fatalf("room gate calls=%+v", gate.calls)
+			}
+		})
+	}
+}
+
+func TestRoomRootGateSeesWhatPiChatLastSaidInTheRoom(t *testing.T) {
+	gate := &fakeGate{answers: map[string]string{chatgate.FlowRoomRespond: "YES"}, errs: map[string]error{}}
+	b := New(&fakeChat{}, &fakeGateway{}, Config{
+		ReplyGateMode: "enforce", ReplyGate: gate, RequireMentionInRooms: false,
+		GateRoomRootUntagged: true,
+	}, nil)
+	b.noteRoomAnswer("spaces/room", "overnight low was 4C and the shed heater ran three times")
+	ev := roomRootEvent()
+	ev.Text = "that seems cold, what was it overnight"
+	if _, suppress := b.replyGate(context.Background(), ev, ev.Prompt()); suppress {
+		t.Fatal("room gate suppressed a follow-up on its own report")
+	}
+	calls := gate.callsFor(chatgate.FlowRoomRespond)
+	if len(calls) != 1 || !strings.Contains(calls[0].summary, "overnight low was 4C") {
+		t.Fatalf("room gate ran without the bot's own last answer: %+v", calls)
+	}
+	if other := b.roomAnswerFor("spaces/other"); other != "" {
+		t.Fatalf("room context leaked across spaces: %q", other)
+	}
+}
+
+func TestRoomRootGateDryRunMeasuresWithoutPosting(t *testing.T) {
+	gate := &fakeGate{answers: map[string]string{chatgate.FlowRoomRespond: "YES"}, errs: map[string]error{}}
+	b := New(&fakeChat{}, &fakeGateway{}, Config{
+		ReplyGateMode: "dry-run", ReplyGate: gate, RequireMentionInRooms: false,
+		GateRoomRootUntagged: true,
+	}, nil)
+	ev := roomRootEvent()
+	if !b.groupMessageEligible(context.Background(), ev) {
+		t.Fatal("dry-run must still measure the room classifier")
+	}
+	if _, suppress := b.replyGate(context.Background(), ev, ev.Prompt()); !suppress {
+		t.Fatal("dry-run would have answered a room message")
+	}
+	if len(gate.callsFor(chatgate.FlowRoomRespond)) != 1 {
+		t.Fatalf("dry-run did not measure: %+v", gate.calls)
 	}
 }
 

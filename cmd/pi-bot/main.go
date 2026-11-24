@@ -35,6 +35,7 @@
 //	PI_CHAT_REPLY_GATE_MODEL   gate model name
 //	PI_CHAT_REPLY_GATE_TIMEOUT_SECONDS  classifier deadline for the first attempt (default 3)
 //	PI_CHAT_REPLY_GATE_ATTEMPT_MS       per-attempt deadlines, comma separated (default 3000,6000,12000)
+//	PI_CHAT_GATE_ROOM_ROOT       ignore|classify (default ignore): send untagged new room messages to the room classifier
 //	PI_CHAT_LOG_LEVEL          debug|info|warn|error (default info)
 package main
 
@@ -276,6 +277,10 @@ func loadSettings() (settings, error) {
 	s.cfg.ReplyGateModel = envDefault("PI_CHAT_REPLY_GATE_MODEL", "unsloth/gemma-4-E4B-it-GGUF:IQ4_XS")
 	s.cfg.ReplyGateTimeout = seconds("PI_CHAT_REPLY_GATE_TIMEOUT_SECONDS", 3*time.Second)
 	s.cfg.ReplyGateAttempts = attemptSchedule("PI_CHAT_REPLY_GATE_ATTEMPT_MS", s.cfg.ReplyGateTimeout)
+	// Room gating is a separate decision from thread gating: an untagged new room message is ignored
+	// outright unless this is set to "classify", in which case the room classifier decides whether
+	// answering would be an intrusion. Enforce answers in a new thread; dry-run only logs.
+	s.cfg.GateRoomRootUntagged = strings.EqualFold(envDefault("PI_CHAT_GATE_ROOM_ROOT", "ignore"), "classify")
 	s.cfg.Eyes = envDefault("PI_CHAT_EYES", s.cfg.Eyes)
 	s.cfg.Thinking = envDefault("PI_CHAT_THINKING", s.cfg.Thinking)
 	s.cfg.PollInterval = seconds("PI_CHAT_POLL_SECONDS", s.cfg.PollInterval)

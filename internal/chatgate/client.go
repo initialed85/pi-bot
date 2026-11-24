@@ -17,6 +17,10 @@ const (
 	DefaultEndpoint   = "https://sentiment-analyzer.dev.initialed85.cc"
 	DefaultModel      = "unsloth/gemma-4-E4B-it-GGUF:IQ4_XS"
 	FlowShouldRespond = "should-respond"
+	// FlowRoomRespond is the harder question: should pi-chat speak up at all over a new top-level room
+	// message it was never added to. It is separate from FlowShouldRespond, which decides inside a
+	// thread pi-chat is already part of.
+	FlowRoomRespond   = "room-respond"
 	FlowThreadRequest = "thread-request"
 	FlowSummary       = "summary"
 )

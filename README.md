@@ -99,11 +99,16 @@ PI_CHAT_REPLY_GATE_URL=https://sentiment-analyzer.dev.initialed85.cc
 PI_CHAT_REPLY_GATE_MODEL=unsloth/gemma-4-E4B-it-GGUF:IQ4_XS
 PI_CHAT_REPLY_GATE_TIMEOUT_SECONDS=3            # deadline for the first attempt
 PI_CHAT_REPLY_GATE_ATTEMPT_MS=3000,6000,12000   # every attempt; unset means double the previous one
+PI_CHAT_GATE_ROOM_ROOT=ignore      # ignore | classify: put untagged new room messages to the room gate
 ```
 
 In `enforce` mode, direct messages can be routed inline or into a new thread, and untagged messages
-inside a group thread can be suppressed. An untagged group top-level message is always ignored before
-any model call; only a thread that already contains an @pi-chat mention is eligible for fuzzy gating.
+inside a group thread can be suppressed. An untagged group top-level message is ignored before any
+model call unless `PI_CHAT_GATE_ROOM_ROOT=classify`, which sends it to the separate `room-respond`
+classifier: it answers in the thread Chat created for that message, and only when it judges the message
+is something pi-chat is being asked about. `dry-run` measures that classifier and logs the decision
+without ever posting, so a room can be trialled without the trial itself becoming the noise.
+An untagged group thread is eligible only if it already contains an @pi-chat mention.
 If the classifier cannot decide - transport failure, timeout after every attempt, or an answer that is
 not an exact token - a 1:1 message still gets the default inline route (it is addressed by construction)
 and a shared-thread message is left unanswered. A mention never reaches the gate, so tagging is always
@@ -112,6 +117,11 @@ The prompts are embedded under `internal/chatgate/prompts/` and are intentionall
 the evaluated prompts in the companion `pi-bot` package. `go test ./...` fetches the upstream prompt
 files and fails on drift, forcing a re-vendor and fresh eval; set `PI_CHAT_GATE_PROMPT_DRIFT_WARN=1`
 only for an intentionally offline CI run.
+
+One caveat governs all of the above: with the app credential, untagged room messages do not arrive as
+push events at all - only DMs and @-mentions do (measured, see `eval/chat-gate/README.md`). Room gating
+is therefore inert until space-wide ingestion lands, which needs a user-authorised subscription rather
+than the app credential.
 
 ## Layout
 
