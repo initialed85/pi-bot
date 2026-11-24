@@ -101,6 +101,10 @@ type Config struct {
 	ReplyGateEndpoint string
 	ReplyGateModel    string
 	ReplyGateTimeout  time.Duration
+	// ReplyGateAttempts is the per-attempt deadline schedule for one classification. Empty means
+	// chatgate's default, which doubles the first deadline: a slow call is almost always a cold
+	// model, and the attempt that wakes it up is not the attempt that should be timed out.
+	ReplyGateAttempts []time.Duration
 }
 
 func DefaultConfig() Config {
@@ -117,7 +121,7 @@ func DefaultConfig() Config {
 		RequireMentionInRooms: true,
 		PrefixWithSender:      true,
 		ReplyGateMode:         "off",
-		ReplyGateTimeout:      2 * time.Second,
+		ReplyGateTimeout:      3 * time.Second,
 	}
 }
 
@@ -172,6 +176,7 @@ func (c Config) withDefaults() Config {
 	if c.ReplyGateTimeout > 0 {
 		d.ReplyGateTimeout = c.ReplyGateTimeout
 	}
+	d.ReplyGateAttempts = c.ReplyGateAttempts
 	d.ReplyGate = c.ReplyGate
 	d.ReplyGateEndpoint = c.ReplyGateEndpoint
 	d.ReplyGateModel = c.ReplyGateModel
@@ -226,7 +231,8 @@ func New(chat Chat, gw Gateway, cfg Config, log *slog.Logger) *Bridge {
 	resolved := cfg.withDefaults()
 	var gate chatgate.Classifier = resolved.ReplyGate
 	if resolved.ReplyGateMode != "off" && gate == nil {
-		gate = chatgate.New(resolved.ReplyGateEndpoint, resolved.ReplyGateModel, resolved.ReplyGateTimeout)
+		gate = chatgate.New(resolved.ReplyGateEndpoint, resolved.ReplyGateModel, resolved.ReplyGateTimeout).
+			WithSchedule(resolved.ReplyGateAttempts...)
 	}
 	b := &Bridge{
 		chat:      chat,
@@ -447,7 +453,12 @@ func (b *Bridge) replyGate(ctx context.Context, ev *chatmsg.Event, message strin
 	started := time.Now()
 	summary := b.summaryFor(ev.Thread)
 	if !ev.DM {
-		if answer, _, _, err := b.gate.Classify(ctx, chatgate.FlowSummary, summary, ev.Who(), message); err == nil {
+		// The running summary is enrichment, not a decision. It gets its own short deadline so a
+		// slow summary cannot eat the budget the actual respond/ignore call needs.
+		summaryCtx, cancelSummary := context.WithTimeout(ctx, 4*time.Second)
+		answer, _, _, err := b.gate.Classify(summaryCtx, chatgate.FlowSummary, summary, ev.Who(), message)
+		cancelSummary()
+		if err == nil {
 			summary = summaryWords(answer)
 			b.setSummary(ev.Thread, summary)
 		}
@@ -460,11 +471,15 @@ func (b *Bridge) replyGate(ctx context.Context, ev *chatmsg.Event, message strin
 	}
 	action := "dry-run-forward"
 	if err != nil {
-		if ev.DM || b.cfg.ReplyGateMode == "enforce" {
+		// The classifier could not decide. In a 1:1 with the app the message is addressed by
+		// construction, so the fallback there is simply the default route. Everywhere else an
+		// undecided message gets no reply: guessing would put unasked-for text in front of other
+		// people. A mention never reaches this path, so tagging remains the guaranteed way to get
+		// an answer when the small model is having a bad day.
+		if ev.DM {
 			action = "fallback-inline"
 		} else {
-			// Preserve the dry-run diagnostic/action shape; dry-run never suppresses regardless.
-			action = "fallback-silent"
+			action = "fallback-suppress"
 		}
 	} else if strings.EqualFold(firstWord(answer), "NO") && !ev.DM {
 		action = "suppress"
@@ -483,7 +498,7 @@ func (b *Bridge) replyGate(ctx context.Context, ev *chatmsg.Event, message strin
 	b.log.Info("reply gate", "thread", ev.Thread, "flow", flow, "prompt", prompt, "answer", answer, "latency_ms", time.Since(started).Milliseconds(), "action", loggedAction)
 	if b.cfg.ReplyGateMode == "enforce" {
 		switch decision {
-		case "suppress":
+		case "suppress", "fallback-suppress":
 			return replyThread, true
 		case "thread":
 			// ev.Thread is the DM's synthetic space thread. Empty means create a new Chat thread.

@@ -55,11 +55,18 @@ for (const line of raw.split("\n")) {
   else if (j.msg === "reply gate warm") warm = "warm-up ok";
 }
 
-// Only a clean NO suppresses. Since 54426e0 the bridge FAILS OPEN on classifier
-// errors, so the legacy dry-run label `fallback-silent` means "classifier could not
-// decide" - enforce answers inline for that. Do not treat it as suppression.
+// Two eras of failure handling live in these logs, and the labels are the only way to tell them
+// apart. Before the retry change, enforce FAILED OPEN: any classifier error answered inline
+// (`fallback-inline`) and the legacy dry-run label `fallback-silent` meant "would have stayed quiet".
+// From the retry change onward, a classifier that cannot decide answers a 1:1 message inline but
+// SILENCES a shared-thread message (`fallback-suppress`). `fallback-suppress` is a failure, not a
+// clean NO - do not fold it into the suppression count, because it means the gate never decided.
 const WOULD_SUPPRESS = new Set(["suppress", "dry-run-suppress"]);
-const FAILED = new Set(["fallback-silent", "dry-run-fallback-silent", "fallback-inline", "dry-run-fallback-inline"]);
+const FAILED = new Set([
+  "fallback-silent", "dry-run-fallback-silent",
+  "fallback-inline", "dry-run-fallback-inline",
+  "fallback-suppress", "dry-run-fallback-suppress",
+]);
 const rows = decisions.map((d) => {
   // The prompt is a rendered multi-line string; the message is the line after
   // the "Latest message..." header, up to the next blank line.
@@ -133,7 +140,7 @@ if (rerouted.length) {
 const answered = rows.filter((r) => !r.suppresses && !r.reroutes).length;
 console.log(`   (${answered} answered in place)`);
 const fb = rows.filter((r) => r.failed);
-if (fb.length) console.log(`   ${fb.length} classifier FAILURE(S)/timeout(s) - the gate did not decide; since 54426e0 enforce answers anyway (fail open):\n` +
+if (fb.length) console.log(`   ${fb.length} classifier FAILURE(S)/timeout(s) - the gate did not decide; pre-retry logs answered those inline, current enforce silences them unless the message was a 1:1:\n` +
   fb.map((r) => `     [${r.time}] ${r.flow} -> ${r.action} after ${r.ms}ms`).join("\n"));
-const slow = rows.filter((r) => r.ms >= 1500);
-if (slow.length) console.log(`\n   ${slow.length} call(s) >=1500ms - near the 2s deadline; slow, but fail-open means these still get answered`);
+const slow = rows.filter((r) => (r.ms ?? 0) >= 1500);
+if (slow.length) console.log(`\n   ${slow.length} call(s) >=1500ms - a cold model; the current schedule is 3s then 6s then 12s, so these are retried rather than cut off at 2s`);

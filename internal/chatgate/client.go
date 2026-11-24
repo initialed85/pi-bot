@@ -47,6 +47,8 @@ type Client struct {
 	model       string
 	http        *http.Client
 	timeout     time.Duration
+	schedule    []time.Duration
+	retryGap    time.Duration
 	warmBackoff []time.Duration
 	warmMu      sync.RWMutex
 	warm        bool
@@ -61,11 +63,45 @@ func New(endpoint, model string, timeout time.Duration) *Client {
 		model = DefaultModel
 	}
 	if timeout <= 0 {
-		timeout = 2 * time.Second
+		timeout = 3 * time.Second
 	}
-	return &Client{endpoint: endpoint, model: model, http: &http.Client{}, timeout: timeout, warmBackoff: []time.Duration{5 * time.Second, 10 * time.Second}}
+	return &Client{
+		endpoint:    endpoint,
+		model:       model,
+		http:        &http.Client{},
+		timeout:     timeout,
+		schedule:    defaultSchedule(timeout),
+		retryGap:    300 * time.Millisecond,
+		warmBackoff: []time.Duration{5 * time.Second, 10 * time.Second},
+	}
 }
 
+// defaultSchedule doubles each attempt: 3s then 6s then 12s. Measured latency is bimodal, not a
+// distribution with a tail: about 90% of calls finish under 250ms and the stragglers are a cold
+// model taking 3-20s (eval/chat-gate/latency.mjs). A single generous deadline would make every
+// message wait for the worst case, while a single tight one throws away the cold calls entirely.
+// Later attempts being more patient is what lets the first attempt wake the model up and the
+// second one answer with it.
+func defaultSchedule(timeout time.Duration) []time.Duration {
+	return []time.Duration{timeout, 2 * timeout, 4 * timeout}
+}
+
+// WithSchedule overrides the attempt deadlines. Empty or non-positive input leaves the default.
+func (c *Client) WithSchedule(deadlines ...time.Duration) *Client {
+	picked := make([]time.Duration, 0, len(deadlines))
+	for _, d := range deadlines {
+		if d > 0 {
+			picked = append(picked, d)
+		}
+	}
+	if len(picked) > 0 {
+		c.schedule = picked
+	}
+	return c
+}
+
+// Classify asks the model, retrying within the attempt schedule. It reports the total time spent
+// across every attempt, because that is the number the bridge actually waits for.
 func (c *Client) Classify(ctx context.Context, flow, summary, sender, message string) (string, string, time.Duration, error) {
 	prompt, err := prompt(flow, summary, sender, message)
 	if err != nil {
@@ -75,9 +111,6 @@ func (c *Client) Classify(ctx context.Context, flow, summary, sender, message st
 	if flow == FlowSummary {
 		limit = 40
 	}
-	started := time.Now()
-	callCtx, cancel := context.WithTimeout(ctx, c.timeout)
-	defer cancel()
 	body, err := json.Marshal(map[string]any{
 		"model":       c.model,
 		"temperature": 0,
@@ -85,20 +118,55 @@ func (c *Client) Classify(ctx context.Context, flow, summary, sender, message st
 		"messages":    []map[string]string{{"role": "user", "content": prompt}},
 	})
 	if err != nil {
-		return "", prompt, time.Since(started), err
+		return "", prompt, 0, err
 	}
-	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, c.endpoint+"/v1/chat/completions", bytes.NewReader(body))
+	schedule := c.schedule
+	if len(schedule) == 0 {
+		schedule = defaultSchedule(c.timeout)
+	}
+	started := time.Now()
+	var last error
+	for attempt, deadline := range schedule {
+		if attempt > 0 {
+			gap := time.NewTimer(c.retryGap)
+			select {
+			case <-ctx.Done():
+				gap.Stop()
+				return "", prompt, time.Since(started), ctx.Err()
+			case <-gap.C:
+			}
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, deadline)
+		answer, err := c.attempt(attemptCtx, body)
+		cancel()
+		if err == nil {
+			return answer, prompt, time.Since(started), nil
+		}
+		last = err
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	if last == nil {
+		last = fmt.Errorf("chatgate: no attempts configured")
+	}
+	return "", prompt, time.Since(started), last
+}
+
+// attempt is a single HTTP round trip against the classifier.
+func (c *Client) attempt(ctx context.Context, body []byte) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint+"/v1/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return "", prompt, time.Since(started), err
+		return "", err
 	}
 	req.Header.Set("content-type", "application/json")
 	res, err := c.http.Do(req)
 	if err != nil {
-		return "", prompt, time.Since(started), err
+		return "", err
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return "", prompt, time.Since(started), fmt.Errorf("chatgate: HTTP %s", res.Status)
+		return "", fmt.Errorf("chatgate: HTTP %s", res.Status)
 	}
 	var response struct {
 		Choices []struct {
@@ -108,21 +176,21 @@ func (c *Client) Classify(ctx context.Context, flow, summary, sender, message st
 		} `json:"choices"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
-		return "", prompt, time.Since(started), fmt.Errorf("chatgate: decode response: %w", err)
+		return "", fmt.Errorf("chatgate: decode response: %w", err)
 	}
 	if len(response.Choices) == 0 {
-		return "", prompt, time.Since(started), fmt.Errorf("chatgate: response contained no choices")
+		return "", fmt.Errorf("chatgate: response contained no choices")
 	}
 	answer := strings.TrimSpace(response.Choices[0].Message.Content)
 	if answer == "" {
-		return "", prompt, time.Since(started), fmt.Errorf("chatgate: response contained no content")
+		return "", fmt.Errorf("chatgate: response contained no content")
 	}
-	return answer, prompt, time.Since(started), nil
+	return answer, nil
 }
 
 // Warm asks the model for a cheap classification so the first real message does not pay cold-start
-// latency. It retries warm-up only: user-facing Classify calls never retry and retain their 2s
-// deadline. The backoff plus three 2s attempts fits comfortably inside the 30s warm-up budget.
+// latency. Warm-up is where the long patience belongs: it may spend its whole 30s budget on one
+// cold model, whereas a user-facing call must not hold a message for that long.
 func (c *Client) Warm(ctx context.Context) error {
 	if c.IsWarm() {
 		return nil

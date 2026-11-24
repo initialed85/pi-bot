@@ -33,7 +33,8 @@
 //	PI_CHAT_REPLY_GATE_MODE    off|dry-run|enforce (default off; dry-run logs, enforce suppresses/reroutes)
 //	PI_CHAT_REPLY_GATE_URL     OpenAI-compatible gate endpoint (default sentiment-analyzer.dev...)
 //	PI_CHAT_REPLY_GATE_MODEL   gate model name
-//	PI_CHAT_REPLY_GATE_TIMEOUT_SECONDS  classifier deadline (default 2)
+//	PI_CHAT_REPLY_GATE_TIMEOUT_SECONDS  classifier deadline for the first attempt (default 3)
+//	PI_CHAT_REPLY_GATE_ATTEMPT_MS       per-attempt deadlines, comma separated (default 3000,6000,12000)
 //	PI_CHAT_LOG_LEVEL          debug|info|warn|error (default info)
 package main
 
@@ -273,7 +274,8 @@ func loadSettings() (settings, error) {
 	s.cfg.ReplyGateMode = envDefault("PI_CHAT_REPLY_GATE_MODE", "off")
 	s.cfg.ReplyGateEndpoint = envDefault("PI_CHAT_REPLY_GATE_URL", "https://sentiment-analyzer.dev.initialed85.cc")
 	s.cfg.ReplyGateModel = envDefault("PI_CHAT_REPLY_GATE_MODEL", "unsloth/gemma-4-E4B-it-GGUF:IQ4_XS")
-	s.cfg.ReplyGateTimeout = seconds("PI_CHAT_REPLY_GATE_TIMEOUT_SECONDS", 2*time.Second)
+	s.cfg.ReplyGateTimeout = seconds("PI_CHAT_REPLY_GATE_TIMEOUT_SECONDS", 3*time.Second)
+	s.cfg.ReplyGateAttempts = attemptSchedule("PI_CHAT_REPLY_GATE_ATTEMPT_MS", s.cfg.ReplyGateTimeout)
 	s.cfg.Eyes = envDefault("PI_CHAT_EYES", s.cfg.Eyes)
 	s.cfg.Thinking = envDefault("PI_CHAT_THINKING", s.cfg.Thinking)
 	s.cfg.PollInterval = seconds("PI_CHAT_POLL_SECONDS", s.cfg.PollInterval)
@@ -354,6 +356,25 @@ func ints(key string) int {
 		}
 	}
 	return 0
+}
+
+// attemptSchedule reads the classifier's per-attempt deadlines in milliseconds. Unset leaves chatgate's
+// own doubling schedule, which is built from the first-attempt timeout.
+func attemptSchedule(key string, first time.Duration) []time.Duration {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return nil
+	}
+	var out []time.Duration
+	for _, part := range strings.Split(value, ",") {
+		if n, err := strconv.Atoi(strings.TrimSpace(part)); err == nil && n > 0 {
+			out = append(out, time.Duration(n)*time.Millisecond)
+		}
+	}
+	if len(out) == 0 {
+		return []time.Duration{first, 2 * first, 4 * first}
+	}
+	return out
 }
 
 func truncate(text string, max int) string {

@@ -55,10 +55,20 @@ Bridge integration contract (for build-google-chat-bot):
 - Thread, untagged: (summary, message) -> should-respond; NO -> suppress AND update summary,
   YES -> forward with summary attached as context, update summary.
 - @pi-chat: never gates. Deterministic reply.
-- Classifier error/timeout: **fail-open since `54426e0`** - a gate that silently ignores a mid-thread
-  message because a GPU is busy is worse than an occasional unwanted reply. DMs answer in-line (never
-  thread); in enforce the in-thread fallback is ANSWER INLINE, while a clean NO still suppresses. Keep
-  the small model warm so timeouts stay rare.
+- Classifier error/timeout: **fail-closed in shared threads, default-route in a 1:1** (Ed's call,
+  2026-11-24: "failed closed i think, if you mean 'classifier failed, can't figure out if this is for
+  me or no'"). This replaced fail-open (`54426e0`). In a 1:1 the message is addressed by construction,
+  so a failed call still answers inline - the only safe fallback there is the route, not a guess about
+  whether it was wanted. In a shared thread an undecided message is silenced, because a wrong guess
+  puts unasked-for text in front of other people. An answer that is not an exact token counts as
+  undecided too. The escape hatch is tagging: a mention never reaches the gate, so @pi-chat always
+  gets an answer.
+- Timeout sizing: `latency.mjs` measures with a 60s ceiling, because the old 2s deadline CENSORED its
+  own evidence - every slow call in the logs reads exactly 2000ms. Measured 2026-11-24: should-respond
+  p50 173ms / p95 3632ms / max 20405ms; thread-request p50 200ms / p95 261ms / max 6269ms; summary
+  p50 1019ms (it asks for 40 tokens). Bimodal, not a tail: fast calls are fast and the stragglers are
+  a cold model. The gate therefore tries 3s, then 6s, then 12s, 300ms apart, and the summary call is
+  capped at 4s so enrichment cannot eat the decision's budget. Keep the small model warm.
 - Rollout: dry-run flag first (log decisions, suppress nothing), then enforce.
 
 ## Running the batches without freezing the chat
@@ -82,6 +92,18 @@ have rerouted into a side thread, and any call approaching the 2s deadline.
     node eval/chat-gate/gate-logs.mjs --since 24h        # live pod logs via kubectl
     node eval/chat-gate/gate-logs.mjs --stdin < logs.txt # or pasted lines
     node eval/chat-gate/gate-logs.mjs --json             # machine-readable
+
+Size the gate timeout with `latency.mjs`. It exists because the deployed logs cannot answer that
+question: a 2s deadline truncates every slow call, so the logs report hundreds of suspiciously
+identical 2000ms decisions and hide whether the real latency was 2.1s or 20s.
+
+```bash
+node eval/chat-gate/latency.mjs                      # all three flows, 2 reps, 60s ceiling
+LATENCY_REPS=4 node eval/chat-gate/latency.mjs should-respond   # one flow, deeper percentiles
+```
+
+It prints p50/p90/p95/p99/max per flow, then what fraction of calls each candidate ceiling would
+have let through on the first try. Run it detached: it hammers the same small model chat is using.
 
 It reads `kubectl logs deploy/pi-bot-bridge` in the dev cluster directly rather than
 depending on log shipping. Top-level group messages ignored *without* a model call are

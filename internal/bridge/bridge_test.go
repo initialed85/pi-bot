@@ -1236,7 +1236,9 @@ func TestReplyGate_InvalidClassifierTokenFallsBack(t *testing.T) {
 		wantSuppress bool
 	}{
 		{dm: true},
-		{dm: false, wantSuppress: false},
+		// An answer that is not an exact token means the model went off-prompt, which is the same
+		// uncertainty as a transport failure: in a shared thread it silences rather than guesses.
+		{dm: false, wantSuppress: true},
 	} {
 		gate := &fakeGate{answers: map[string]string{
 			chatgate.FlowThreadRequest: "THREAD because...",
@@ -1257,9 +1259,12 @@ func TestReplyGate_Fallbacks(t *testing.T) {
 		dm           bool
 		wantSuppress bool
 		wantThread   string
+		wantAction   string
 	}{
-		{name: "dm classifier failure", dm: true, wantThread: "spaces/test/threads/thread-1"},
-		{name: "thread classifier failure", dm: false, wantSuppress: false, wantThread: "spaces/test/threads/thread-1"},
+		// A 1:1 message is addressed by construction, so a failed classifier still gets the default
+		// route. In a shared thread an undecided message is silenced: tagging is the escape hatch.
+		{name: "dm classifier failure", dm: true, wantThread: "spaces/test/threads/thread-1", wantAction: "fallback-inline"},
+		{name: "thread classifier failure", dm: false, wantSuppress: true, wantThread: "spaces/test/threads/thread-1", wantAction: "fallback-suppress"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			gate := &fakeGate{answers: map[string]string{}, errs: map[string]error{
@@ -1273,8 +1278,8 @@ func TestReplyGate_Fallbacks(t *testing.T) {
 			if suppress != test.wantSuppress || got != test.wantThread {
 				t.Fatalf("route=%q suppress=%v, want route=%q suppress=%v", got, suppress, test.wantThread, test.wantSuppress)
 			}
-			if !test.dm && !strings.Contains(logs.String(), "action=fallback-inline") {
-				t.Fatalf("logs=%q, want action=fallback-inline", logs.String())
+			if !strings.Contains(logs.String(), "action="+test.wantAction) {
+				t.Fatalf("logs=%q, want action=%s", logs.String(), test.wantAction)
 			}
 		})
 	}

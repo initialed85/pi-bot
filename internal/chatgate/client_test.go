@@ -3,6 +3,7 @@ package chatgate
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -99,26 +100,61 @@ func TestWarmFailureDoesNotMarkWarm(t *testing.T) {
 	}
 }
 
-func TestClassifyKeepsTwoSecondDefaultAndDoesNotRetry(t *testing.T) {
+// The schedule is the whole point of the retry design: patient only on the later attempts, so a
+// cold model gets woken by the first one and still answers on the second.
+func TestClassifyAttemptScheduleDoublesAndDefaultIsThreeSeconds(t *testing.T) {
 	client := New("http://127.0.0.1:1", "test-model", 0)
-	if client.timeout != 2*time.Second {
-		t.Fatalf("default timeout=%s, want 2s", client.timeout)
+	if client.timeout != 3*time.Second {
+		t.Fatalf("default first-attempt timeout=%s, want 3s", client.timeout)
 	}
+	want := []time.Duration{3 * time.Second, 6 * time.Second, 12 * time.Second}
+	if fmt.Sprint(client.schedule) != fmt.Sprint(want) {
+		t.Fatalf("schedule=%v, want %v", client.schedule, want)
+	}
+}
+
+func TestClassifyRetriesAfterTransportFailureAndReportsTotalWait(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			http.Error(w, "cold model", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"YES"}}]}`))
+	}))
+	defer server.Close()
+
+	client := New(server.URL, "test-model", 0).WithSchedule(200*time.Millisecond, 200*time.Millisecond)
+	started := time.Now()
+	answer, _, latency, err := client.Classify(context.Background(), FlowShouldRespond, "", "a person", "hello")
+	if err != nil {
+		t.Fatalf("retry did not recover: %v", err)
+	}
+	if answer != "YES" || calls.Load() != 2 {
+		t.Fatalf("answer=%q calls=%d, want YES after 2 calls", answer, calls.Load())
+	}
+	if elapsed := time.Since(started); elapsed < client.retryGap || latency < client.retryGap {
+		t.Fatalf("elapsed=%s latency=%s, want at least the %s gap between attempts", elapsed, latency, client.retryGap)
+	}
+}
+
+func TestClassifyStopsAfterTheScheduleIsSpent(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
-		time.Sleep(200 * time.Millisecond)
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 	}))
 	defer server.Close()
-	client = New(server.URL, "test-model", 30*time.Millisecond)
+
+	client := New(server.URL, "test-model", 30*time.Millisecond).WithSchedule(30*time.Millisecond, 30*time.Millisecond, 30*time.Millisecond)
 	started := time.Now()
 	if _, _, _, err := client.Classify(context.Background(), FlowShouldRespond, "", "", "message"); err == nil {
 		t.Fatal("classification unexpectedly succeeded")
 	}
-	if calls.Load() != 1 {
-		t.Fatalf("classification calls=%d, want one (no user-call retry)", calls.Load())
+	if calls.Load() != 3 {
+		t.Fatalf("calls=%d, want one per scheduled attempt", calls.Load())
 	}
-	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
-		t.Fatalf("classification took %s, timeout was not enforced", elapsed)
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("classification took %s, the attempt schedule was not enforced", elapsed)
 	}
 }

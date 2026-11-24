@@ -97,14 +97,17 @@ gated message, and preserve the existing Chat behaviour. It never gates `@pi-cha
 PI_CHAT_REPLY_GATE_MODE=dry-run       # off | dry-run | enforce (application default: off)
 PI_CHAT_REPLY_GATE_URL=https://sentiment-analyzer.dev.initialed85.cc
 PI_CHAT_REPLY_GATE_MODEL=unsloth/gemma-4-E4B-it-GGUF:IQ4_XS
-PI_CHAT_REPLY_GATE_TIMEOUT_SECONDS=2
+PI_CHAT_REPLY_GATE_TIMEOUT_SECONDS=3            # deadline for the first attempt
+PI_CHAT_REPLY_GATE_ATTEMPT_MS=3000,6000,12000   # every attempt; unset means double the previous one
 ```
 
 In `enforce` mode, direct messages can be routed inline or into a new thread, and untagged messages
 inside a group thread can be suppressed. An untagged group top-level message is always ignored before
 any model call; only a thread that already contains an @pi-chat mention is eligible for fuzzy gating.
-Classifier failures fall back to inline DMs and silence untagged group-thread messages. Do not enable
-`enforce` until dry-run logs have been reviewed.
+If the classifier cannot decide - transport failure, timeout after every attempt, or an answer that is
+not an exact token - a 1:1 message still gets the default inline route (it is addressed by construction)
+and a shared-thread message is left unanswered. A mention never reaches the gate, so tagging is always
+the way to force an answer. Do not enable `enforce` until dry-run logs have been reviewed.
 The prompts are embedded under `internal/chatgate/prompts/` and are intentionally kept identical to
 the evaluated prompts in the companion `pi-bot` package. `go test ./...` fetches the upstream prompt
 files and fails on drift, forcing a re-vendor and fresh eval; set `PI_CHAT_GATE_PROMPT_DRIFT_WARN=1`
