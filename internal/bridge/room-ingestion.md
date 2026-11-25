@@ -1,10 +1,11 @@
 # Room ingestion brief: the user-authorised listener
 
 Status: capability proven end-to-end, and the consumer is written (pi-bot@master, `internal/bridge`
-`HandleWorkspace`). Staged behind `PI_CHAT_USER_LISTENER`, which is **off** in the cluster until the
-OAuth credential is a Secret. Write against bridge digest `sha256:a73d34cd…` (pi-bot@1986bbf) or
-later; `PI_CHAT_GATE_ROOM_ROOT` is unset in the live manifest, which means the room gate is compiled
-in but currently set to ignore.
+`HandleWorkspace`). Staged behind `PI_CHAT_USER_LISTENER`, which is **off** in the cluster until Ed approves
+turning it on. The image carrying it is live since 2026-11-25T04:0xZ: digest `sha256:39e6d8da…dae387`
+(pi-bot@b8fe57d, built by CI pipeline #8), pod `pi-bot-bridge-6cdb98f8b7-p6n7z`, with the OAuth Secret
+projected at 0400. `PI_CHAT_GATE_ROOM_ROOT` is unset in the live manifest, which means the room gate is
+compiled in but set to ignore.
 
 ## Why this path exists
 
@@ -138,9 +139,11 @@ volumeMounts:
 - [x] Bot-authored events produce no turn (unit test on the captured real payload).
 - [x] A mentioned message arriving on both paths is answered exactly once (unit test).
 - [x] Renewal runs in-process and reports its own expiry (unit test against a fake API).
-- [ ] Live end-to-end with `PI_CHAT_USER_LISTENER=on`: one untagged room message → classifier asked
-      in dry-run → **real classifier verdicts on real text reviewed** → then `PI_CHAT_GATE_ROOM_ROOT`
-      moved to `classify` and `PI_CHAT_REPLY_GATE_MODE=enforce` for that room.
+- [ ] Live end-to-end with `PI_CHAT_USER_LISTENER=on` and `PI_CHAT_GATE_ROOM_ROOT=dry-run`, leaving
+      `PI_CHAT_REPLY_GATE_MODE=enforce`: one untagged room message → classifier asked → **real classifier
+      verdicts on real text reviewed** → then `PI_CHAT_GATE_ROOM_ROOT` moved to `classify` for that room.
+      The mode split matters: putting the whole bridge in dry-run to trial the room would un-suppress the
+      group-thread messages the gate has been silencing since enforce was set.
 - [ ] Participant message text verified absent from live INFO logs.
 - [ ] No secret in this repo, and none in the manifest as an env var.
 

@@ -99,15 +99,24 @@ PI_CHAT_REPLY_GATE_URL=https://sentiment-analyzer.dev.initialed85.cc
 PI_CHAT_REPLY_GATE_MODEL=unsloth/gemma-4-E4B-it-GGUF:IQ4_XS
 PI_CHAT_REPLY_GATE_TIMEOUT_SECONDS=3            # deadline for the first attempt
 PI_CHAT_REPLY_GATE_ATTEMPT_MS=3000,6000,12000   # every attempt; unset means double the previous one
-PI_CHAT_GATE_ROOM_ROOT=ignore      # ignore | classify: put untagged new room messages to the room gate
+PI_CHAT_GATE_ROOM_ROOT=ignore      # ignore | dry-run | classify: what an untagged new room message gets
 ```
 
 In `enforce` mode, direct messages can be routed inline or into a new thread, and untagged messages
 inside a group thread can be suppressed. An untagged group top-level message is ignored before any
-model call unless `PI_CHAT_GATE_ROOM_ROOT=classify`, which sends it to the separate `room-respond`
-classifier: it answers in the thread Chat created for that message, and only when it judges the message
-is something pi-chat is being asked about. `dry-run` measures that classifier and logs the decision
-without ever posting, so a room can be trialled without the trial itself becoming the noise.
+model call unless `PI_CHAT_GATE_ROOM_ROOT` says otherwise: `classify` (synonym: `enforce`) sends it to the
+separate `room-respond` classifier, which answers in the thread Chat created for that message and only
+when it judges the message is something pi-chat is being asked about. `dry-run` consults the same
+classifier and logs the verdict without ever posting, so a room can be trialled without the trial itself
+becoming the noise.
+
+That room switch is deliberately separate from `PI_CHAT_REPLY_GATE_MODE`, and the reason is a trap that was
+in the original design: there used to be one gate mode, so trialling a room meant setting the whole bridge
+to `dry-run`, and `dry-run` never suppresses anything. Group-thread messages the gate had been silencing
+would have started being answered for the length of the trial, i.e. reviewing the feature would have
+changed the behaviour people were already relying on. `PI_CHAT_REPLY_GATE_MODE=enforce` plus
+`PI_CHAT_GATE_ROOM_ROOT=dry-run` is the shape that measures a room while every flow that already gates
+keeps gating. `TestRoomDryRunDoesNotDowngradeFlowsThatAlreadyGate` is the test for that.
 An untagged group thread is eligible only if it already contains an @pi-chat mention.
 If the classifier cannot decide - transport failure, timeout after every attempt, or an answer that is
 not an exact token - a 1:1 message still gets the default inline route (it is addressed by construction)
@@ -118,19 +127,75 @@ the evaluated prompts in the companion `pi-bot` package. `go test ./...` fetches
 files and fails on drift, forcing a re-vendor and fresh eval; set `PI_CHAT_GATE_PROMPT_DRIFT_WARN=1`
 only for an intentionally offline CI run.
 
-One caveat governs all of the above: with the app credential, untagged room messages do not arrive as
-push events at all - only DMs and @-mentions do (measured, see `eval/chat-gate/README.md`). Room gating
-is therefore inert until space-wide ingestion lands, which needs a user-authorised subscription rather
-than the app credential.
+One caveat governs all of the above: with the **app** credential, untagged room messages do not arrive
+as push events at all - only DMs and @-mentions do (measured, see `eval/chat-gate/README.md`). Room
+gating only has something to gate once the user-authorised room listener below is delivering.
+
+## Room listener (the user-authorised ingestion path)
+
+The Chat app credential hears mentions and its own DMs, and nothing else. A Workspace Events
+subscription authorised by a human OAuth token hears every message in every room that human belongs
+to, which is the only way untagged room traffic exists for us. Enabling it is a privacy decision, not
+just a deployment one: `spaces/-` sees rooms containing other people.
+
+```bash
+PI_CHAT_USER_LISTENER=off              # off | on (default off)
+PI_CHAT_USER_TOPIC=pi-chat-user-events
+PI_CHAT_USER_SUBSCRIPTION=pi-chat-user-events-sub
+PI_CHAT_USER_RENEW=on                  # on | off (default on whenever the listener is on)
+PI_CHAT_USER_RENEW_MINUTES=180         # subscriptions live ~4h (measured twice)
+PI_CHAT_USER_OAUTH_CLIENT_FILE=/etc/pi-chat-user-oauth/client_id
+PI_CHAT_USER_OAUTH_SECRET_FILE=/etc/pi-chat-user-oauth/client_secret
+PI_CHAT_USER_OAUTH_TOKEN_FILE=/etc/pi-chat-user-oauth/refresh_token
+```
+
+The credential is read from files, never from env vars: a secret in an env var shows up in
+`kubectl describe pod`, in a crashed subprocess dump and in a stray `set -x`. Both file shapes work -
+one installed-client JSON file, or three plain files from a `--from-literal` Secret - and the reader
+decides which by content.
+
+What the listener does with a message is deliberately narrow, in this order:
+
+1. **Loop guard.** Google delivers pi-chat's own replies as events with `sender.type = BOT`. Answering
+   those is a conversation the bot has with itself in front of other people.
+2. **Ownership.** Mentions and 1:1 DMs are left to the app path, which already receives them with the
+   envelope identity a slash command needs. That decision runs *before* the dedupe mark, otherwise the
+   listener copy consumes the key and the app copy is dropped as a duplicate - a tagged message going
+   unanswered is the failure mode, and it is tested.
+3. **Dedupe** on `message.name`, identical on both paths.
+4. **`onMessage`**, the same entry point the app path uses, so the allowlist, room eligibility and the
+   reply gate are not reimplemented here and cannot drift into a second, looser policy.
+
+The subscription expires on a timer and the API refuses to list subscriptions, so the renewer discovers
+the live name from the `409` error metadata and logs a new `expireTime` on every renewal. Renewal
+failure logs at ERROR with the next attempt scheduled; a listener that has gone deaf is never silent.
+
+`internal/bridge/room-ingestion.md` is the operational brief: measured constraints, the payload
+contract, the mask that is not actually validated, and what is still unknown.
+
+### Reviewing the gate before it speaks
+
+```bash
+go build -o /tmp/pi-chat-audit ./cmd/pi-chat-audit
+PI_CHAT_AUDIT_RUN_SECONDS=300s /tmp/pi-chat-audit
+```
+
+`cmd/pi-chat-audit` replays the user-events backlog through the real decision path - the real
+`HandleWorkspace`, the real classifier, the same allowlist and space lookup - and prints what the gate
+would have decided. It cannot post: its Chat implementation returns errors for Post, Update and Delete,
+and its gateway refuses to ask Pi. It reads with the same user OAuth credential that authorises the
+subscription, and it acknowledges what it reviews, so run it deliberately.
 
 ## Layout
 
 ```
 cmd/pi-bot/   main: config, Pub/Sub consumer, health endpoints, graceful drain
-internal/chatmsg/     event parsing (wrapped add-on shape and flat shape), fixtures in testdata/
-internal/chatapi/     Chat API client: post, patch, get, delete, media download
+cmd/pi-chat-audit/    offline room-gate review: replays the backlog, decides without speaking
+internal/chatmsg/     event parsing (add-on shape, flat shape, Workspace Events CloudEvents), fixtures in testdata/
+internal/chatapi/     Chat API client: post, patch, get, delete, media download, space type
+internal/chatevents/  Workspace Events subscription renewal and the user OAuth credential
 internal/gateway/     HTTP client for the Pi gateway
-internal/bridge/      allowlist, dedupe, commands, images, turn watching, chunking
+internal/bridge/      allowlist, dedupe, commands, images, turn watching, chunking, room listener
 gateway/index.ts      Pi extension: in-process HTTP control of the live session
 ```
 

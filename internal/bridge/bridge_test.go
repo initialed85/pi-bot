@@ -1443,9 +1443,11 @@ func TestRoomRootGateSeesWhatPiChatLastSaidInTheRoom(t *testing.T) {
 
 func TestRoomRootGateDryRunMeasuresWithoutPosting(t *testing.T) {
 	gate := &fakeGate{answers: map[string]string{chatgate.FlowRoomRespond: "YES"}, errs: map[string]error{}}
+	// The room trial mode is deliberately independent of the global gate mode: the deployed bridge runs
+	// enforce for mentions, DMs and tagged threads, and watching a room must not downgrade those.
 	b := New(&fakeChat{}, &fakeGateway{}, Config{
-		ReplyGateMode: "dry-run", ReplyGate: gate, RequireMentionInRooms: false,
-		GateRoomRootUntagged: true,
+		ReplyGateMode: "enforce", ReplyGate: gate, RequireMentionInRooms: false,
+		GateRoomRootMode: "dry-run",
 	}, nil)
 	ev := roomRootEvent()
 	if !b.groupMessageEligible(context.Background(), ev) {
@@ -1456,6 +1458,45 @@ func TestRoomRootGateDryRunMeasuresWithoutPosting(t *testing.T) {
 	}
 	if len(gate.callsFor(chatgate.FlowRoomRespond)) != 1 {
 		t.Fatalf("dry-run did not measure: %+v", gate.calls)
+	}
+}
+
+// The whole bridge used to have one gate mode, so trialling a room meant setting dry-run globally, and
+// dry-run never suppresses: group-thread messages the gate had been silencing would have been answered
+// for the duration of the trial. This is the regression test for that trap.
+func TestRoomDryRunDoesNotDowngradeFlowsThatAlreadyGate(t *testing.T) {
+	gate := &fakeGate{answers: map[string]string{
+		chatgate.FlowRoomRespond:   "YES",
+		chatgate.FlowSummary:       "garage door still open",
+		chatgate.FlowShouldRespond: "NO",
+	}, errs: map[string]error{}}
+	b := New(&fakeChat{}, &fakeGateway{}, Config{
+		ReplyGateMode: "enforce", GateRoomRootMode: "dry-run", ReplyGate: gate, RequireMentionInRooms: false,
+	}, nil)
+	if _, suppress := b.replyGate(context.Background(), roomRootEvent(), "anyone seen my other phone"); !suppress {
+		t.Fatal("room dry-run answered in a shared room")
+	}
+	if _, suppress := b.replyGate(context.Background(), gateEvent(false, false), "mum says she'll bring the esky"); !suppress {
+		t.Fatal("room dry-run turned should-respond suppression into an answer")
+	}
+	if len(gate.callsFor(chatgate.FlowShouldRespond)) != 1 {
+		t.Fatalf("should-respond did not run while the room was being watched: %+v", gate.calls)
+	}
+}
+
+func TestRoomGateModeAliasesAndUnknownValues(t *testing.T) {
+	if got := New(&fakeChat{}, &fakeGateway{}, Config{GateRoomRootMode: "classify"}, nil).cfg.GateRoomRootMode; got != "enforce" {
+		t.Fatalf("classify alias=%q, want enforce", got)
+	}
+	if got := New(&fakeChat{}, &fakeGateway{}, Config{GateRoomRootUntagged: true}, nil).cfg.GateRoomRootMode; got != "enforce" {
+		t.Fatalf("legacy bool did not map to a mode: %q", got)
+	}
+	// A typo in a pod env var must not put untested text in front of other people.
+	if got := New(&fakeChat{}, &fakeGateway{}, Config{GateRoomRootMode: "sometimes"}, nil).cfg.GateRoomRootMode; got != "ignore" {
+		t.Fatalf("unknown room mode %q did not fall back to ignoring", got)
+	}
+	if got := New(&fakeChat{}, &fakeGateway{}, Config{}, nil).cfg.GateRoomRootMode; got != "ignore" {
+		t.Fatalf("default room mode=%q, want ignore", got)
 	}
 }
 

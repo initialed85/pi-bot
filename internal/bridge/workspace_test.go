@@ -181,8 +181,8 @@ func TestHandleWorkspace_RoomClassifierIsAskedInDryRun(t *testing.T) {
 	gate := &fakeGate{answers: map[string]string{chatgate.FlowRoomRespond: "YES"}, errs: map[string]error{}}
 	b, chat, gw := listenerBridge(Config{
 		RequireMentionInRooms: true,
-		GateRoomRootUntagged:  true,
-		ReplyGateMode:         "dry-run",
+		GateRoomRootMode:      "dry-run",
+		ReplyGateMode:         "enforce",
 		ReplyGate:             gate,
 	})
 	if err := b.HandleWorkspace(context.Background(), "psm-2", listenerAttrs, listenerFixture(t, "workspace_room_untagged.json")); err != nil {

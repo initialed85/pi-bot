@@ -35,14 +35,15 @@
 //	PI_CHAT_REPLY_GATE_MODEL   gate model name
 //	PI_CHAT_REPLY_GATE_TIMEOUT_SECONDS  classifier deadline for the first attempt (default 3)
 //	PI_CHAT_REPLY_GATE_ATTEMPT_MS       per-attempt deadlines, comma separated (default 3000,6000,12000)
-//	PI_CHAT_GATE_ROOM_ROOT       ignore|classify (default ignore): send untagged new room messages to the room classifier
+//	PI_CHAT_GATE_ROOM_ROOT       ignore|dry-run|classify|enforce (default ignore): untagged new room messages - ignored, judged but not answered, or judged and answered
 //	PI_CHAT_USER_LISTENER        off|on (default off): also consume the user-authorised room listener subscription
 //	PI_CHAT_USER_SUBSCRIPTION    Pub/Sub subscription fed by the Workspace Events listener (default pi-chat-user-events-sub)
 //	PI_CHAT_USER_TOPIC           the topic that listener publishes to, used when renewing (default pi-chat-user-events)
 //	PI_CHAT_USER_RENEW           on|off (default on when the listener is on): recreate the Workspace Events subscription on a timer
 //	PI_CHAT_USER_RENEW_MINUTES   renewal interval, must stay inside the measured ~4h subscription lifetime (default 180)
-//	PI_CHAT_USER_OAUTH_CLIENT_FILE  file holding {client_id, client_secret} for the human OAuth grant (default /etc/pi-chat-user/oauth-client.json)
-//	PI_CHAT_USER_OAUTH_TOKEN_FILE   file holding the refresh token, bare or {"refresh_token": …} (default /etc/pi-chat-user/refresh-token)
+//	PI_CHAT_USER_OAUTH_CLIENT_FILE  file holding the client id, or one installed-client JSON file with both id and secret (default /etc/pi-chat-user-oauth/client_id)
+//	PI_CHAT_USER_OAUTH_SECRET_FILE  file holding the client secret when the client id arrived on its own (default /etc/pi-chat-user-oauth/client_secret)
+//	PI_CHAT_USER_OAUTH_TOKEN_FILE   file holding the refresh token, bare or {"refresh_token": …} (default /etc/pi-chat-user-oauth/refresh_token)
 //	PI_CHAT_LOG_LEVEL          debug|info|warn|error (default info)
 package main
 
@@ -359,10 +360,13 @@ func loadSettings() (settings, error) {
 	s.cfg.ReplyGateModel = envDefault("PI_CHAT_REPLY_GATE_MODEL", "unsloth/gemma-4-E4B-it-GGUF:IQ4_XS")
 	s.cfg.ReplyGateTimeout = seconds("PI_CHAT_REPLY_GATE_TIMEOUT_SECONDS", 3*time.Second)
 	s.cfg.ReplyGateAttempts = attemptSchedule("PI_CHAT_REPLY_GATE_ATTEMPT_MS", s.cfg.ReplyGateTimeout)
-	// Room gating is a separate decision from thread gating: an untagged new room message is ignored
-	// outright unless this is set to "classify", in which case the room classifier decides whether
-	// answering would be an intrusion. Enforce answers in a new thread; dry-run only logs.
-	s.cfg.GateRoomRootUntagged = strings.EqualFold(envDefault("PI_CHAT_GATE_ROOM_ROOT", "ignore"), "classify")
+	// Room gating is a separate decision from thread gating, and it gets its own mode deliberately: the
+	// only way to trial a room without it was to put the whole bridge in dry-run, and dry-run never
+	// suppresses anything, so trialling the room would have un-suppressed group-thread messages the gate
+	// has been keeping quiet since enforce was set. "dry-run" here consults and logs the room classifier
+	// while PI_CHAT_REPLY_GATE_MODE stays on enforce. "classify" is accepted as the original name for
+	// "enforce".
+	s.cfg.GateRoomRootMode = envDefault("PI_CHAT_GATE_ROOM_ROOT", "ignore")
 
 	// The room listener is a separate capability from the app path, and it is off by default: it reads
 	// every message in every space the authorising human belongs to, so enabling it is an explicit

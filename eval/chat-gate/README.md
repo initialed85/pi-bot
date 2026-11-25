@@ -47,16 +47,22 @@ Design decisions baked into the prompts:
 - summary is additive-merge with a hard 30-word cap; unchanged messages pass through.
 
 Bridge integration contract (for build-google-chat-bot):
-- **`initialed85/pi-bot` IS registered in Woodpecker and CI does build it** (home-ops measured 2026-11-25:
-  Woodpecker in the `woodpecker` namespace on the home-dev context, `repo_id 36`, pipelines 1198-1218 all
-  `success`, one `killed` superseded push; today's builds `60f249e` -> `sha256:a73d34cd`, `ab28749` ->
-  `sha256:03e99f2e`, `b8fe57d` -> `sha256:39e6d8da…dae387`, also tagged `latest`).
-  An earlier version of this file asserted the opposite, based on reading `woodpecker-postgres` in the *prod*
-  cluster on 2026-11-21 (no `repos` row, zero pipelines for `5e16eb3`, `54426e0`, `5b75505`, `f13fc7f`).
-  That was the wrong server: pi-bot's pipelines run on home-dev's Woodpecker, not prod's. Do not re-derive CI
-  status from a memory of one query - `kubectl --context home-dev -n woodpecker` is where this repo's builds live.
-  What has NOT been verified is whether those pipelines run `go test ./...` / `go vet` for this repo, or only
-  build and push the image. Until someone reads a pipeline log, treat the checks below as things you run yourself.
+- **`initialed85/pi-bot` IS registered in Woodpecker and CI does build it.** home-ops read the rows on
+  2026-11-25 (their lane, their query - do not re-derive it): Woodpecker in the `woodpecker` namespace on
+  the home-dev context, `repos` id 36 `pi-bot` active, pipelines #1-#8 for that repo all `success`, one
+  superseded `killed`. Commit to image, as they read it: `#1 2b28b99 -> 1def2dab`,
+  `#2 1986bbf -> a73d34cd` (pushed 2026-11-24T09:28Z, tag timestamp equal to the pipeline run, so nothing
+  hand-built it), `#7 ab28749 -> 03e99f2e`, `#8 b8fe57d -> sha256:39e6d8da…dae387` (also tagged `latest`).
+  Registration landed 24 Nov; only the pre-registration lineage (`5e16eb3` … `f13fc7f`, 21 Nov) was built by
+  hand, on Ed's workstation lane, which no agent in the fleet has access to.
+  An earlier version of this file asserted the repo had never been registered, from reading
+  `woodpecker-postgres` in the *prod* cluster on 2026-11-21 (no `repos` row, zero pipelines). That was the
+  wrong server: pi-bot's pipelines run on home-dev's Woodpecker. Query `kubectl --context home-dev -n
+  woodpecker` before concluding anything about this repo's CI.
+  Repo-scoped Woodpecker secrets for pi-bot are 0 rows, so the Hub credential the runner uses lives outside
+  the per-repo secret store; nobody in the fleet needs it and nobody should go looking for it.
+  What has NOT been verified is whether those pipelines run `go test ./...` / `go vet` for this repo or only
+  build and push. Until someone reads a pipeline log, treat the checks below as things you run yourself.
 - The bridge embeds these prompts (`internal/chatgate/prompts/`, `go:embed`). **Prompt text is owned
   here.** Edit `prompts/*.md`, re-run the eval, then `node revendor.mjs` to copy them into the bridge.
   The authoritative equality check is `internal/chatgate/prompt_drift_test.go`: it fetches these files

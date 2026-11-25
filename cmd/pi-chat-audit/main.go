@@ -431,8 +431,8 @@ func run() error {
 		// The two settings that make this review worth running: the room classifier is consulted for
 		// untagged room messages, and its verdict is treated as binding rather than logged alongside
 		// an answer that happens anyway.
-		GateRoomRootUntagged: true,
-		ReplyGateMode:        "enforce",
+		GateRoomRootMode: "enforce",
+		ReplyGateMode:    "enforce",
 		ReplyGate: &recordingGate{
 			inner: chatgate.New(
 				envDefault("PI_CHAT_REPLY_GATE_URL", chatgate.DefaultEndpoint),

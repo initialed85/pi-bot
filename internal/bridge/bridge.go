@@ -60,12 +60,21 @@ type Config struct {
 	// always ignored unless they mention the app; untagged follow-ups are gated only inside a thread
 	// where the app was previously mentioned.
 	RequireMentionInRooms bool
-	// GateRoomRootUntagged decides what a new top-level, untagged group message does. False (default)
-	// keeps the historical rule: ignored with no model call. True sends it to the room classifier, which
-	// answers in the thread Chat created for that message only when it judges the message is something
-	// pi-chat is being asked about. It only has effect when ReplyGateMode is enforce (it acts) or dry-run
-	// (the decision is logged and dropped), so a room can be trialled without the trial becoming the noise.
+	// GateRoomRootUntagged is the original bool form of GateRoomRootMode and is retained so existing
+	// configs keep compiling. true means "enforce", false means "ignore". Prefer GateRoomRootMode.
 	GateRoomRootUntagged bool
+	// GateRoomRootMode decides what a new top-level, untagged group message does, independently of
+	// ReplyGateMode:
+	//   "ignore" (default) - no model call at all; the message is dropped, which is the historical rule.
+	//   "dry-run"          - the room classifier is consulted and its verdict is logged, but a would-be
+	//                        answer is dropped, so reviewing the feature is not itself the noise.
+	//   "enforce"          - the verdict is acted on. "classify" is accepted as the original name.
+	// The separation is the point: a room can be trialled in dry-run while mentions, DMs and tagged
+	// threads keep enforcing under ReplyGateMode. Setting the whole bridge to dry-run to trial one flow
+	// would silently un-suppress the flows that already gate, i.e. answer messages the gate had been
+	// keeping quiet. Room gating is inert when ReplyGateMode is off, because that is what creates the
+	// classifier.
+	GateRoomRootMode string
 	// StatusMode decides what happens to the status bubble a turn gets:
 	//   "patch" (default)  - the bubble is rewritten in place, so one message carries 👀 -> 🤔 ->
 	//                        the answer. Nothing is deleted, which is what Ed asked for after
@@ -128,6 +137,7 @@ func DefaultConfig() Config {
 		ImageMaxBytes:         4 << 20,
 		MaxImages:             4,
 		GateRoomRootUntagged:  false,
+		GateRoomRootMode:      "ignore",
 		RequireMentionInRooms: true,
 		PrefixWithSender:      true,
 		ReplyGateMode:         "off",
@@ -191,6 +201,24 @@ func (c Config) withDefaults() Config {
 	// A bool has no sentinel to test against, so it is copied rather than defaulted: leaving it out
 	// silently drops the operator's setting.
 	d.GateRoomRootUntagged = c.GateRoomRootUntagged
+	roomMode := strings.ToLower(strings.TrimSpace(c.GateRoomRootMode))
+	switch roomMode {
+	case "":
+		// Only the legacy bool was set.
+		if c.GateRoomRootUntagged {
+			roomMode = "enforce"
+		} else {
+			roomMode = "ignore"
+		}
+	case "classify", "on", "true":
+		roomMode = "enforce"
+	case "off", "false":
+		roomMode = "ignore"
+	case "ignore", "dry-run", "enforce":
+	default:
+		roomMode = DefaultConfig().GateRoomRootMode
+	}
+	d.GateRoomRootMode = roomMode
 	d.ReplyGateEndpoint = c.ReplyGateEndpoint
 	d.ReplyGateModel = c.ReplyGateModel
 	d.Allowlist = c.Allowlist
@@ -242,6 +270,12 @@ func New(chat Chat, gw Gateway, cfg Config, log *slog.Logger) *Bridge {
 		default:
 			log.Warn("unrecognised status mode, falling back to the default", "value", cfg.StatusMode, "using", defaults.StatusMode)
 		}
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.GateRoomRootMode)) {
+	case "", "ignore", "off", "false", "dry-run", "classify", "on", "true", "enforce":
+	default:
+		log.Warn("unrecognised room root gate mode, falling back to ignoring room messages",
+			"value", cfg.GateRoomRootMode, "valid", "ignore|dry-run|enforce")
 	}
 	resolved := cfg.withDefaults()
 	var gate chatgate.Classifier = resolved.ReplyGate
@@ -459,14 +493,20 @@ func (b *Bridge) onMessage(ctx context.Context, ev *chatmsg.Event) error {
 // it. Dry-run deliberately returns today's route and never suppresses a prompt.
 func (b *Bridge) replyGate(ctx context.Context, ev *chatmsg.Event, message string) (string, bool) {
 	replyThread := ev.Thread
-	if b.gate == nil || b.cfg.ReplyGateMode == "off" || ev.Mentioned {
-		return replyThread, false
-	}
 	flow := chatgate.FlowShouldRespond
 	if ev.DM {
 		flow = chatgate.FlowThreadRequest
 	} else if isTopLevel(ev) {
 		flow = chatgate.FlowRoomRespond
+	}
+	// The room flow answers to its own switch, so trialling a room in dry-run cannot turn the flows
+	// that already gate into no-ops.
+	mode := b.cfg.ReplyGateMode
+	if flow == chatgate.FlowRoomRespond {
+		mode = b.cfg.GateRoomRootMode
+	}
+	if b.gate == nil || mode == "off" || mode == "ignore" || ev.Mentioned {
+		return replyThread, false
 	}
 	started := time.Now()
 	summary := b.summaryFor(ev.Thread)
@@ -514,16 +554,16 @@ func (b *Bridge) replyGate(ctx context.Context, ev *chatmsg.Event, message strin
 	}
 	decision := action
 	loggedAction := action
-	if b.cfg.ReplyGateMode == "dry-run" {
+	if mode == "dry-run" {
 		loggedAction = "dry-run-" + action
 	}
 	b.log.Info("reply gate", "thread", ev.Thread, "flow", flow, "prompt", prompt, "answer", answer, "latency_ms", time.Since(started).Milliseconds(), "action", loggedAction)
-	if flow == chatgate.FlowRoomRespond && b.cfg.ReplyGateMode != "enforce" {
+	if flow == chatgate.FlowRoomRespond && mode != "enforce" {
 		// Dry-run measures the room classifier without putting new text in a shared room: a would-be
 		// room answer is logged and dropped, so reviewing the feature cannot itself be the noise.
 		return replyThread, true
 	}
-	if b.cfg.ReplyGateMode == "enforce" {
+	if mode == "enforce" {
 		switch decision {
 		case "suppress", "fallback-suppress":
 			return replyThread, true
@@ -556,8 +596,7 @@ func (b *Bridge) groupMessageEligible(ctx context.Context, ev *chatmsg.Event) bo
 	// name. Historically that meant no model call at all; with room gating on it reaches the room
 	// classifier instead, which decides whether answering would be an intrusion.
 	if isTopLevel(ev) {
-		return b.cfg.GateRoomRootUntagged &&
-			(b.cfg.ReplyGateMode == "enforce" || b.cfg.ReplyGateMode == "dry-run")
+		return b.cfg.GateRoomRootMode == "dry-run" || b.cfg.GateRoomRootMode == "enforce"
 	}
 	if b.isPiThread(ev.Thread) {
 		return true
