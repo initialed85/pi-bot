@@ -85,6 +85,7 @@ type settings struct {
 	userRenew           bool
 	userRenewEvery      time.Duration
 	userOAuthClientFile string
+	userOAuthSecretFile string
 	userOAuthTokenFile  string
 }
 
@@ -167,7 +168,7 @@ func run() error {
 			"renewal", fmt.Sprintf("%v", s.userRenew))
 	}
 	if s.userListener && s.userRenew {
-		cred, err := chatevents.LoadCredential(s.userOAuthClientFile, s.userOAuthTokenFile)
+		cred, err := chatevents.LoadCredential(s.userOAuthClientFile, s.userOAuthSecretFile, s.userOAuthTokenFile)
 		if err != nil {
 			logger.Error("room listener credential unavailable; group rooms stay unanswered",
 				"client_file", s.userOAuthClientFile, "token_file", s.userOAuthTokenFile, "err", err)
@@ -371,8 +372,12 @@ func loadSettings() (settings, error) {
 	s.userTopic = envDefault("PI_CHAT_USER_TOPIC", "pi-chat-user-events")
 	s.userRenew = !strings.EqualFold(envDefault("PI_CHAT_USER_RENEW", "on"), "off")
 	s.userRenewEvery = minutes("PI_CHAT_USER_RENEW_MINUTES", 180*time.Minute)
-	s.userOAuthClientFile = envDefault("PI_CHAT_USER_OAUTH_CLIENT_FILE", "/etc/pi-chat-user/oauth-client.json")
-	s.userOAuthTokenFile = envDefault("PI_CHAT_USER_OAUTH_TOKEN_FILE", "/etc/pi-chat-user/refresh-token")
+	// The paths are home-ops's shipped Secret layout (pi-chat-user-oauth projected at 0400 as three
+	// files). The reader works out which shape it was given, so a future Secret that ships one JSON
+	// client file instead needs no manifest change.
+	s.userOAuthClientFile = envDefault("PI_CHAT_USER_OAUTH_CLIENT_FILE", "/etc/pi-chat-user-oauth/client_id")
+	s.userOAuthSecretFile = envDefault("PI_CHAT_USER_OAUTH_SECRET_FILE", "/etc/pi-chat-user-oauth/client_secret")
+	s.userOAuthTokenFile = envDefault("PI_CHAT_USER_OAUTH_TOKEN_FILE", "/etc/pi-chat-user-oauth/refresh_token")
 	if s.userRenewEvery < 30*time.Minute {
 		// Renewing every couple of minutes would churn a resource Google rate-limits, and it buys nothing.
 		s.userRenewEvery = 30 * time.Minute

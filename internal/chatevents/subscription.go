@@ -51,22 +51,45 @@ type Credential struct {
 
 // LoadCredential reads the two files the deployment mounts: one holding the OAuth client, one holding
 // the refresh token. Both are expected to be 0400 from a Secret, and neither is ever logged.
-func LoadCredential(clientFile, tokenFile string) (Credential, error) {
+// LoadCredential reads the user OAuth credential from files, in whichever shape the operator actually
+// produced. Both exist in this fleet and neither is obvious from the path:
+//
+//   - one installed-client JSON file holding client_id and client_secret, plus a token file. That is
+//     what a Google desktop client export looks like and what tools/chat-user-subscription.mjs reads.
+//   - three separate files, which is what a Kubernetes Secret built from --from-literal projects into
+//     a mount: /etc/pi-chat-user-oauth/{client_id,client_secret,refresh_token}.
+//
+// secretFile is only consulted for the second shape. Choosing by content rather than by a flag means
+// an operator who wires the wrong shape gets a clear message about the two files that are missing, not
+// a token exchange that fails with an unhelpful `invalid_grant` three steps later.
+func LoadCredential(clientFile, secretFile, tokenFile string) (Credential, error) {
 	var cred Credential
 	raw, err := os.ReadFile(clientFile)
 	if err != nil {
 		return cred, fmt.Errorf("chatevents: read oauth client file: %w", err)
 	}
-	var client struct {
-		ClientID     string `json:"client_id"`
-		ClientSecret string `json:"client_secret"`
-		Type         string `json:"type"`
+	trimmed := strings.TrimSpace(string(raw))
+	if strings.HasPrefix(trimmed, "{") {
+		var client struct {
+			ClientID     string `json:"client_id"`
+			ClientSecret string `json:"client_secret"`
+			Type         string `json:"type"`
+		}
+		if err := json.Unmarshal(raw, &client); err != nil {
+			return cred, fmt.Errorf("chatevents: decode oauth client file: %w", err)
+		}
+		cred.ClientID = strings.TrimSpace(client.ClientID)
+		cred.ClientSecret = strings.TrimSpace(client.ClientSecret)
+	} else {
+		cred.ClientID = trimmed
 	}
-	if err := json.Unmarshal(raw, &client); err != nil {
-		return cred, fmt.Errorf("chatevents: decode oauth client file: %w", err)
+	if cred.ClientSecret == "" && strings.TrimSpace(secretFile) != "" {
+		raw, err := os.ReadFile(secretFile)
+		if err != nil {
+			return cred, fmt.Errorf("chatevents: read oauth client secret file: %w", err)
+		}
+		cred.ClientSecret = strings.TrimSpace(string(raw))
 	}
-	cred.ClientID = strings.TrimSpace(client.ClientID)
-	cred.ClientSecret = strings.TrimSpace(client.ClientSecret)
 
 	raw, err = os.ReadFile(tokenFile)
 	if err != nil {
@@ -85,7 +108,7 @@ func LoadCredential(clientFile, tokenFile string) (Credential, error) {
 	cred.RefreshToken = token
 
 	if cred.ClientID == "" || cred.ClientSecret == "" || cred.RefreshToken == "" {
-		return cred, fmt.Errorf("chatevents: credential files are incomplete (client id, client secret and refresh token are all required)")
+		return cred, fmt.Errorf("chatevents: credential files are incomplete (client id, client secret and refresh token are all required; expected one installed-client JSON file, or three files: id, secret, token)")
 	}
 	return cred, nil
 }
@@ -143,6 +166,8 @@ func (r *Renewer) api() string {
 	return subscriptionsAPI
 }
 
+var tokenHTTP = &http.Client{Timeout: 20 * time.Second}
+
 func (r *Renewer) tokenURL() string {
 	if strings.TrimSpace(r.TokenURL) != "" {
 		return r.TokenURL
@@ -180,6 +205,10 @@ func (r *Renewer) renewOnce(ctx context.Context) {
 }
 
 // Renew deletes the live subscription and creates it again, returning the new expireTime.
+func (r *Renewer) accessToken(ctx context.Context) (string, error) {
+	return r.Cred.accessToken(ctx, r.tokenURL())
+}
+
 func (r *Renewer) Renew(ctx context.Context) (string, error) {
 	token, err := r.accessToken(ctx)
 	if err != nil {
@@ -226,19 +255,25 @@ type duplicateSubscriptionError struct {
 
 func (e *duplicateSubscriptionError) Error() string { return e.err.Error() }
 
-func (r *Renewer) accessToken(ctx context.Context) (string, error) {
+// AccessToken exchanges the refresh token for an access token. It is exported because the read-only
+// sibling of the bridge (cmd/pi-chat-audit) needs the same credential without a Renewer.
+func (c Credential) AccessToken(ctx context.Context) (string, error) {
+	return c.accessToken(ctx, tokenEndpoint)
+}
+
+func (c Credential) accessToken(ctx context.Context, endpoint string) (string, error) {
 	form := url.Values{
-		"client_id":     {r.Cred.ClientID},
-		"client_secret": {r.Cred.ClientSecret},
-		"refresh_token": {r.Cred.RefreshToken},
+		"client_id":     {c.ClientID},
+		"client_secret": {c.ClientSecret},
+		"refresh_token": {c.RefreshToken},
 		"grant_type":    {"refresh_token"},
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.tokenURL(), strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("content-type", "application/x-www-form-urlencoded")
-	res, err := r.hc.Do(req)
+	res, err := tokenHTTP.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("chatevents: token refresh: %w", err)
 	}

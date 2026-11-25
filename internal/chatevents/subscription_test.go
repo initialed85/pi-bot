@@ -31,7 +31,7 @@ func writeCredentialFiles(t *testing.T) (string, string) {
 
 func TestLoadCredential(t *testing.T) {
 	clientFile, tokenFile := writeCredentialFiles(t)
-	cred, err := LoadCredential(clientFile, tokenFile)
+	cred, err := LoadCredential(clientFile, "", tokenFile)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -45,9 +45,45 @@ func TestLoadCredential(t *testing.T) {
 	if err := os.WriteFile(wrapped, []byte(`{"refresh_token":"wrapped-value"}`), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	cred, err = LoadCredential(clientFile, wrapped)
+	cred, err = LoadCredential(clientFile, "", wrapped)
 	if err != nil || cred.RefreshToken != "wrapped-value" {
 		t.Fatalf("wrapped token: cred=%+v err=%v", cred, err)
+	}
+}
+
+// TestLoadCredentialReadsTheSecretMountShape is the layout home-ops actually shipped: a Secret built
+// from --from-literal projects three plain files, and none of them is JSON.
+func TestLoadCredentialReadsTheSecretMountShape(t *testing.T) {
+	dir := t.TempDir()
+	idFile := filepath.Join(dir, "client_id")
+	secretFile := filepath.Join(dir, "client_secret")
+	tokenFile := filepath.Join(dir, "refresh_token")
+	write := func(path, value string) {
+		if err := os.WriteFile(path, []byte(value+"\n"), 0o400); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	write(idFile, "id-from-secret")
+	write(secretFile, "secret-from-secret")
+	write(tokenFile, "token-from-secret")
+
+	cred, err := LoadCredential(idFile, secretFile, tokenFile)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cred != (Credential{ClientID: "id-from-secret", ClientSecret: "secret-from-secret", RefreshToken: "token-from-secret"}) {
+		t.Fatalf("credential = %+v", cred)
+	}
+
+	// A JSON client file that names no secret falls back to the separate secret file, because that is
+	// the half-written state an operator gets into when they export a client and forget the secret.
+	jsonFile := filepath.Join(dir, "client.json")
+	if err := os.WriteFile(jsonFile, []byte(`{"client_id":"json-id"}`), 0o400); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cred, err = LoadCredential(jsonFile, secretFile, tokenFile)
+	if err != nil || cred.ClientID != "json-id" || cred.ClientSecret != "secret-from-secret" {
+		t.Fatalf("mixed shape: cred=%+v err=%v", cred, err)
 	}
 }
 
@@ -61,10 +97,10 @@ func TestLoadCredentialRefusesAnIncompleteCredential(t *testing.T) {
 	if err := os.WriteFile(tokenFile, []byte("t"), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if _, err := LoadCredential(clientFile, tokenFile); err == nil {
+	if _, err := LoadCredential(clientFile, "", tokenFile); err == nil {
 		t.Fatal("expected an error when the client secret is missing")
 	}
-	if _, err := LoadCredential(filepath.Join(dir, "missing.json"), tokenFile); err == nil {
+	if _, err := LoadCredential(filepath.Join(dir, "missing.json"), "", tokenFile); err == nil {
 		t.Fatal("expected an error when the client file does not exist")
 	}
 }
