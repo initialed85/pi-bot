@@ -203,3 +203,19 @@ API shapes worth remembering, all measured rather than read out of docs:
   room, and `spaces.list` returns names and types without display names. So rooms cannot be named from
   this credential; they can only be identified by their members or their messages.
 - The bridge's own `GetSpace` call (SDK, no field mask) returns the full space and is unaffected.
+
+### De-mentioned positives (2026-11-25)
+
+`judge --de-mention` takes root messages a human *did* address to the app - requests made because the
+person wanted an answer - strips the mention and asks what the gate would have done had the same words
+arrived untagged. Real intent, no staging. In the friends room it yields 2 samples only, both plumbing
+test text ("test tag", "blah foo this is a message"), and both judge NO. Those NOs are correct rather
+than damning: in both the mention carried the whole intent, so untagged they are not requests at all.
+In-thread mentions are excluded by design - untagged, they are answered by the enforce path without
+consulting the model, so judging them would measure a path that does not exist.
+
+The measured positive-side numbers come from the staged set, re-run today rather than quoted from
+memory: `room-respond` **36/37 correct (97.3%), mean 200ms** - `for-bot 12/12`, `human-to-human 15/16`,
+`hard 9/9`. **Zero false suppression** on content-bearing requests. The single miss `rr-20` is the
+opposite failure: the gate answers human-to-human chatter about pi-chat that nobody invited it into.
+That asymmetry is the thing dry-run traffic now has to confirm or clear.

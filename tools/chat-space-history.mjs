@@ -18,6 +18,8 @@
 // Usage:
 //   node tools/chat-space-history.mjs list [--space AAAA1pNBS1A] [--pageSize 50]
 //   node tools/chat-space-history.mjs judge [--space AAAA1pNBS1A] [--pageSize 50] [--gate URL]
+//   node tools/chat-space-history.mjs judge --de-mention   # positive samples: root messages a human
+//                                                           # addressed to the app, judged untagged
 //
 // Privacy: text is printed for allowlisted senders only (PIBOT_ALLOWLIST, default Ed and Amy); other
 // participants' text is replaced with a description unless --show-text is passed explicitly. Verdicts
@@ -199,6 +201,38 @@ async function main() {
   console.log(`prompt: ${PROMPT_FILE}\ngate: ${GATE} model: ${MODEL} max_tokens=4 temperature=0 (the shipped request shape)`);
   for (const r of rows) {
     console.log(`\n${r.createTime}  ${r.sender}\n  ${r.shown}\n  -> ${r.verdict}`);
+  }
+
+  if (args.includes('--de-mention')) {
+    // A message a human addressed to the app is, by construction, something a person wanted answered.
+    // Strip the mention and ask what the gate would have done had the same words arrived untagged: that is
+    // a positive sample authored by a real person in real context, with no staging and nobody performing.
+    // A NO here is an upper bound on false suppression that needs a human eyeball, because the mention is
+    // sometimes the only thing that made the message a request - not a clean defect.
+    const positives = [];
+    for (let i = 0; i < ordered.length; i++) {
+      const m = ordered[i];
+      // Only roots qualify. An in-thread mention untagged would be unanswered by the enforce path without
+      // ever consulting the model, so judging it would measure a path that does not exist.
+      if (m.bot || !m.mentionsApp || m.inThread) continue;
+      const stripped = (m.text ?? '').replace(/@\s*pi-?chat\b/gi, '').replace(/\s+/g, ' ').trim();
+      if (!stripped) { positives.push({ ...m, stripped: '', verdict: 'no sample: the mention was the whole message' }); continue; }
+      let summary = '';
+      for (let j = i - 1; j >= 0; j--) {
+        if (ordered[j].bot) { summary = summaryWords(ordered[j].text); break; }
+      }
+      try {
+        const verdict = await callGate(fillTemplate(template, { summary, sender: m.sender, message: stripped }));
+        positives.push({ ...m, stripped, verdict: verdict || '<empty>' });
+      } catch (err) {
+        positives.push({ ...m, stripped, verdict: `gate error: ${err.message}` });
+      }
+    }
+    console.log(`\nde-mentioned positives (root messages a human addressed to the app, judged as if untagged): ${positives.length}`);
+    for (const p of positives) {
+      const shownStripped = SHOW_TEXT || ALLOW.includes(p.sender) ? p.stripped : `<participant not on the allowlist: ${p.sender}>`;
+      console.log(`\n${p.createTime}  ${p.sender}\n  was: ${p.shown}\n  as untagged: ${shownStripped}\n  -> ${p.verdict}`);
+    }
   }
   return 0;
 }
