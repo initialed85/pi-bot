@@ -168,16 +168,20 @@ async function pull(H) {
     const recs = j.receivedMessages ?? [];
     if (!recs.length) { await new Promise((res) => setTimeout(res, 3000)); continue; }
     for (const rec of recs) {
-      const d = rec.message?.data ? JSON.parse(Buffer.from(rec.message.data, 'base64').toString('utf8')) : {};
-      const a = d.attributes ?? {};
-      const m = d.message ?? {};
+      const env = rec.message ?? {};
+      // CloudEvents over Pub/Sub puts ce-* on the envelope attributes and the JSON body in data.
+      // Reading them out of the decoded body is the mistake that prints undefined for everything.
+      const a = env.attributes ?? {};
+      const body = env.data ? JSON.parse(Buffer.from(env.data, 'base64').toString('utf8')) : {};
+      const m = body.message ?? {};
       const human = m.sender?.type === 'HUMAN';
       // Other people's rooms are in scope now; only the account owner's own test text is printed.
       const text = human ? String(m.text ?? '').slice(0, 60) : '<participant message: text not printed>';
-      console.log(`ce-type: ${a['ce-type']} | space: ${a['ce-subject']} | sender: ${m.sender?.name} (${m.sender?.type})`);
-      console.log(`  thread: ${m.thread?.name ?? '-'} | annotations: ${(m.annotations ?? []).map((x) => x.type).join('+') || 'none'}`);
+      console.log(`ce-type: ${a['ce-type'] ?? 'unset'} | space: ${a['ce-subject'] ?? 'unset'} | sender: ${m.sender?.name ?? 'unset'} (${m.sender?.type ?? 'unset'})`);
+      console.log(`  published: ${env.publishTime ?? 'unset'} | thread: ${m.thread?.name ?? '-'} | annotations: ${(m.annotations ?? []).map((x) => x.type).join('+') || 'none'}`);
       console.log(`  text: ${text}`);
-      if (args.includes('--raw')) console.log('  raw: ' + JSON.stringify(d).slice(0, 900));
+      if (args.includes('--raw')) console.log('  raw envelope: ' + JSON.stringify({ attributes: a, publishTime: env.publishTime, messageId: env.messageId, orderingKey: env.orderingKey }).slice(0, 700));
+      if (args.includes('--raw')) console.log('  raw body: ' + JSON.stringify(body).slice(0, 900));
       await fetch(`https://pubsub.googleapis.com/v1/projects/${PROJECT}/subscriptions/${SUB_NAME}:acknowledge`, { method: 'POST', headers: H, body: JSON.stringify({ ackIds: [rec.ackId] }) });
     }
     console.log(`pulled ${recs.length} event(s) on ${TOPIC} (round ${round})`);
