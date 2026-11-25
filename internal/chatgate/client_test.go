@@ -85,6 +85,36 @@ func TestWarmRetriesAndMarksWarmOnlyAfterSuccess(t *testing.T) {
 	}
 }
 
+// IsWarm is a claim about this client, not about the server: an idle endpoint drops the model long after
+// the client last asked, so a keep-alive loop needs the variant that never skips.
+func TestKeepWarmAsksTheServerAgainEvenWhenAlreadyWarm(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"YES"}}]}`))
+	}))
+	defer server.Close()
+
+	client := New(server.URL, "test-model", 30*time.Millisecond)
+	client.warmBackoff = []time.Duration{0}
+	if err := client.Warm(context.Background()); err != nil {
+		t.Fatalf("warm-up: %v", err)
+	}
+	if attempts != 1 || !client.IsWarm() {
+		t.Fatalf("after warm-up attempts=%d warm=%v", attempts, client.IsWarm())
+	}
+	// Warm() is the idempotent one; that is what makes it useless as a heartbeat.
+	if err := client.Warm(context.Background()); err != nil || attempts != 1 {
+		t.Fatalf("Warm() re-asked the server: attempts=%d err=%v", attempts, err)
+	}
+	if err := client.KeepWarm(context.Background()); err != nil {
+		t.Fatalf("keep-warm: %v", err)
+	}
+	if attempts != 2 || !client.IsWarm() {
+		t.Fatalf("KeepWarm did not re-ask and re-mark warm: attempts=%d warm=%v", attempts, client.IsWarm())
+	}
+}
+
 func TestWarmFailureDoesNotMarkWarm(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "still cold", http.StatusServiceUnavailable)

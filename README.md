@@ -100,7 +100,15 @@ PI_CHAT_REPLY_GATE_MODEL=unsloth/gemma-4-E4B-it-GGUF:IQ4_XS
 PI_CHAT_REPLY_GATE_TIMEOUT_SECONDS=3            # deadline for the first attempt
 PI_CHAT_REPLY_GATE_ATTEMPT_MS=3000,6000,12000   # every attempt; unset means double the previous one
 PI_CHAT_GATE_ROOM_ROOT=ignore      # ignore | dry-run | classify: what an untagged new room message gets
+PI_CHAT_GATE_KEEPALIVE_MINUTES=5   # re-warm the endpoint this often; "off" warms at boot only
 ```
+
+The keep-alive exists because of a measurement, not a hunch. On the shipped endpoint, a room decision
+that arrived after ~70 minutes of silence cost **17982ms**, while the same prompt after ~11 minutes of
+silence cost **203-394ms**: the server drops the model when nobody is talking, and without a heartbeat
+the next person's message pays for the reload inside the answering path, in front of a retry budget that
+is deliberately short. `Warm()` skips once it has succeeded, which is exactly why it cannot serve as the
+heartbeat; `KeepWarm()` clears that claim and asks again.
 
 In `enforce` mode, direct messages can be routed inline or into a new thread, and untagged messages
 inside a group thread can be suppressed. An untagged group top-level message is ignored before any

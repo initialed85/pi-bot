@@ -231,6 +231,17 @@ func (c *Client) IsWarm() bool {
 	return c.warm
 }
 
+// KeepWarm runs the same patient warm-up as Warm but never skips it. IsWarm is only a claim about what
+// this client once saw: an inference server that has been idle for an hour has usually dropped the model
+// long after this client stopped asking. Measured on the shipped endpoint, the first call after ~70
+// minutes idle cost 17982ms, after ~11 minutes idle it cost 203-394ms.
+func (c *Client) KeepWarm(ctx context.Context) error {
+	c.warmMu.Lock()
+	c.warm = false
+	c.warmMu.Unlock()
+	return c.Warm(ctx)
+}
+
 func prompt(flow, summary, sender, message string) (string, error) {
 	name := flow
 	if name == "" {

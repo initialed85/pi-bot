@@ -433,6 +433,14 @@ func loadSettings() (settings, error) {
 	s.cfg.PollInterval = seconds("PI_CHAT_POLL_SECONDS", s.cfg.PollInterval)
 
 	s.cfg.MaxWait = minutes("PI_CHAT_MAX_WAIT_MINUTES", s.cfg.MaxWait)
+	// The classifier endpoint drops the model when a room goes quiet, and the next message pays for that
+	// load inside the answering path. A number here re-warms it that often in the background; "off" means
+	// warm once at boot and never again.
+	if raw := strings.TrimSpace(os.Getenv("PI_CHAT_GATE_KEEPALIVE_MINUTES")); raw == "off" || raw == "none" {
+		s.cfg.GateKeepAlive = -1
+	} else {
+		s.cfg.GateKeepAlive = minutes("PI_CHAT_GATE_KEEPALIVE_MINUTES", s.cfg.GateKeepAlive)
+	}
 	if v := ints("PI_CHAT_MAX_CHARS"); v > 0 {
 		s.cfg.MaxChars = v
 	}

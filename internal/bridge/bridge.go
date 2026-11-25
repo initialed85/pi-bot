@@ -133,6 +133,13 @@ type Config struct {
 	ReplyGateEndpoint string
 	ReplyGateModel    string
 
+	// GateKeepAlive is how often the bridge re-warms the classifier endpoint in the background. The point
+	// is not the model's comfort: an idle inference server drops the model, and the next person's message
+	// then pays that load inside the answering path - measured 17982ms for a room decision after ~70
+	// minutes idle, against 203-394ms when the endpoint had only been idle ~11 minutes. Zero inherits the
+	// default; a negative value warms once at boot and never again.
+	GateKeepAlive time.Duration
+
 	// Identity turns a room event's users/<id> into an email when the event carries none - which is all
 	// of them. Measured on the deployed listener (2026-11-25T07:00Z, logged verbatim): the sender object
 	// a room message ships is exactly {"name":"users/<id>","type":"HUMAN"}, while the allowlist is
@@ -168,6 +175,7 @@ func DefaultConfig() Config {
 		PrefixWithSender:      true,
 		ReplyGateMode:         "off",
 		ReplyGateTimeout:      3 * time.Second,
+		GateKeepAlive:         5 * time.Minute,
 	}
 }
 
@@ -221,6 +229,11 @@ func (c Config) withDefaults() Config {
 	}
 	if c.ReplyGateTimeout > 0 {
 		d.ReplyGateTimeout = c.ReplyGateTimeout
+	}
+	// 0 means "not set" so a manifest that says nothing still keeps the endpoint warm. Negative is the
+	// operator spelling for "warm at boot only".
+	if c.GateKeepAlive != 0 {
+		d.GateKeepAlive = c.GateKeepAlive
 	}
 	d.ReplyGateAttempts = c.ReplyGateAttempts
 	d.ReplyGate = c.ReplyGate
@@ -352,11 +365,30 @@ func New(chat Chat, gw Gateway, cfg Config, log *slog.Logger) *Bridge {
 		b.log.Info("room identity seeded", "people", len(resolved.IdentitySeed))
 	}
 	if warmer, ok := gate.(interface{ Warm(context.Context) error }); ok {
+		keepAlive := resolved.GateKeepAlive
+		if keepAlive == 0 {
+			keepAlive = DefaultConfig().GateKeepAlive
+		}
+		// The keeper also has to re-warm rather than skip: Warm() short-circuits once it has succeeded
+		// once, and "this client succeeded an hour ago" is not evidence the server still holds the model.
+		keeper, canKeep := gate.(interface{ KeepWarm(context.Context) error })
 		go func() {
 			if err := warmer.Warm(context.Background()); err != nil {
 				log.Warn("reply gate warm-up failed", "err", err)
 			} else {
 				log.Info("reply gate warm")
+			}
+			if keepAlive < 0 || !canKeep {
+				return
+			}
+			ticker := time.NewTicker(keepAlive)
+			defer ticker.Stop()
+			for range ticker.C {
+				if err := keeper.KeepWarm(context.Background()); err != nil {
+					log.Warn("reply gate keep-warm failed", "err", err)
+					continue
+				}
+				log.Info("reply gate kept warm", "every", keepAlive)
 			}
 		}()
 	}

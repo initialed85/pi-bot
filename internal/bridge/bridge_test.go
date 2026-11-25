@@ -1148,10 +1148,32 @@ type gateCall struct {
 }
 
 type fakeGate struct {
-	mu      sync.Mutex
-	answers map[string]string
-	errs    map[string]error
-	calls   []gateCall
+	mu        sync.Mutex
+	answers   map[string]string
+	errs      map[string]error
+	calls     []gateCall
+	warms     int
+	keepWarms int
+}
+
+func (g *fakeGate) Warm(_ context.Context) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.warms++
+	return nil
+}
+
+func (g *fakeGate) KeepWarm(_ context.Context) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.keepWarms++
+	return nil
+}
+
+func (g *fakeGate) warmCounts() (int, int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.warms, g.keepWarms
 }
 
 func (g *fakeGate) Classify(_ context.Context, flow, summary, sender, message string) (string, string, time.Duration, error) {
@@ -1551,6 +1573,7 @@ func TestWithDefaultsCarriesEveryConfigField(t *testing.T) {
 		IdentitySeed:          map[string]string{"users/1": "someone@example.com"},
 		ReplyGateTimeout:      3 * time.Second,
 		ReplyGateAttempts:     []time.Duration{3 * time.Second},
+		GateKeepAlive:         30 * time.Millisecond,
 	}
 
 	out := in.withDefaults()
@@ -1570,6 +1593,49 @@ func TestWithDefaultsCarriesEveryConfigField(t *testing.T) {
 		if isZeroValue(outValue.Field(i)) {
 			t.Errorf("Config.%s was set and came back empty: withDefaults dropped it", name)
 		}
+	}
+}
+
+// A quiet room is not a free room. The inference endpoint drops the model while nobody is talking, and
+// the next real message pays for the reload inside the answering path (measured on the shipped endpoint:
+// 17982ms after ~70 minutes idle, 203-394ms after ~11). The bridge keeps it warm in the background.
+func TestBridgeKeepsTheGateWarmAfterBoot(t *testing.T) {
+	gate := &fakeGate{answers: map[string]string{}, errs: map[string]error{}}
+	cfg := fastConfig()
+	cfg.ReplyGate = gate
+	cfg.ReplyGateMode = "enforce"
+	cfg.GateKeepAlive = 20 * time.Millisecond
+	New(&fakeChat{downloads: map[string][]byte{}}, &fakeGateway{turns: map[string]gateway.Turn{}}, cfg, nil)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		warms, keeps := gate.warmCounts()
+		if warms >= 1 && keeps >= 2 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	warms, keeps := gate.warmCounts()
+	t.Fatalf("warms=%d keepWarms=%d, want the boot warm-up plus at least two keep-warms", warms, keeps)
+}
+
+// PI_CHAT_GATE_KEEPALIVE_MINUTES=off has to mean off, not "the default anyway": a deployment that says
+// no background calls should not be making them.
+func TestBridgeGateKeepAliveOffMeansOff(t *testing.T) {
+	gate := &fakeGate{answers: map[string]string{}, errs: map[string]error{}}
+	cfg := fastConfig()
+	cfg.ReplyGate = gate
+	cfg.ReplyGateMode = "enforce"
+	cfg.GateKeepAlive = -1
+	New(&fakeChat{downloads: map[string][]byte{}}, &fakeGateway{turns: map[string]gateway.Turn{}}, cfg, nil)
+
+	time.Sleep(150 * time.Millisecond)
+	warms, keeps := gate.warmCounts()
+	if warms < 1 {
+		t.Fatalf("warm-up at boot did not run: warms=%d", warms)
+	}
+	if keeps != 0 {
+		t.Fatalf("keep-alive said off but made %d background calls", keeps)
 	}
 }
 
