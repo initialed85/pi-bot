@@ -147,12 +147,22 @@ PI_CHAT_USER_RENEW_MINUTES=180         # subscriptions live ~4h (measured twice)
 PI_CHAT_USER_OAUTH_CLIENT_FILE=/etc/pi-chat-user-oauth/client_id
 PI_CHAT_USER_OAUTH_SECRET_FILE=/etc/pi-chat-user-oauth/client_secret
 PI_CHAT_USER_OAUTH_TOKEN_FILE=/etc/pi-chat-user-oauth/refresh_token
+PI_CHAT_ROOM_IDENTITY_SEED=            # comma separated "users/<id>=someone@example.com" (default empty)
 ```
 
 The credential is read from files, never from env vars: a secret in an env var shows up in
 `kubectl describe pod`, in a crashed subprocess dump and in a stray `set -x`. Both file shapes work -
 one installed-client JSON file, or three plain files from a `--from-literal` Secret - and the reader
 decides which by content.
+
+A room event ships a sender as `{"name":"users/<id>","type":"HUMAN"}` and nothing else (measured on the
+deployed listener, and logged verbatim as `sender_json` when a message cannot be attributed). The allowlist
+works on emails, so `internal/chatevents/senders.go` resolves id to email by reading the recent messages
+of the space the message landed in - the one Chat read that publishes `name` and `email` together, under
+the same human credential that renews the subscription. Positives cache for a day; a miss gets a five
+minute cooldown per (space, id) so an unallowlisted regular cannot cost an API call per message. A seed
+is applied first, so a pod that has just been rolled can answer a room before it has read anything.
+Verify against the real API with `PI_CHAT_REAL_PROBE=1 go test -count=1 -run LiveSenderLookup -v ./internal/chatevents`.
 
 What the listener does with a message is deliberately narrow, in this order:
 
