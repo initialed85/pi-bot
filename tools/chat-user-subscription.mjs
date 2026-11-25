@@ -161,6 +161,7 @@ async function pull(H) {
   }
   const deadline = Date.now() + wait * 1000;
   let round = 0;
+  let total = 0;
   while (Date.now() < deadline) {
     round++;
     const r = await fetch(`https://pubsub.googleapis.com/v1/projects/${PROJECT}/subscriptions/${SUB_NAME}:pull`, { method: 'POST', headers: H, body: JSON.stringify({ maxMessages: 20, returnImmediately: false }) });
@@ -179,12 +180,19 @@ async function pull(H) {
       const text = human ? String(m.text ?? '').slice(0, 60) : '<participant message: text not printed>';
       console.log(`ce-type: ${a['ce-type'] ?? 'unset'} | space: ${a['ce-subject'] ?? 'unset'} | sender: ${m.sender?.name ?? 'unset'} (${m.sender?.type ?? 'unset'})`);
       console.log(`  published: ${env.publishTime ?? 'unset'} | thread: ${m.thread?.name ?? '-'} | annotations: ${(m.annotations ?? []).map((x) => x.type).join('+') || 'none'}`);
+      const nm = String(m.name ?? '');
+      const parts = nm.split('/').pop()?.split('.') ?? [];
+      console.log(`  name: ${nm || 'unset'} | position: ${parts.length === 2 && parts[0] === parts[1] ? 'thread root' : parts.length === 2 ? 'reply inside thread' : 'unknown'}`);
       console.log(`  text: ${text}`);
       if (args.includes('--raw')) console.log('  raw envelope: ' + JSON.stringify({ attributes: a, publishTime: env.publishTime, messageId: env.messageId, orderingKey: env.orderingKey }).slice(0, 700));
       if (args.includes('--raw')) console.log('  raw body: ' + JSON.stringify(body).slice(0, 900));
       await fetch(`https://pubsub.googleapis.com/v1/projects/${PROJECT}/subscriptions/${SUB_NAME}:acknowledge`, { method: 'POST', headers: H, body: JSON.stringify({ ackIds: [rec.ackId] }) });
     }
-    console.log(`pulled ${recs.length} event(s) on ${TOPIC} (round ${round})`);
+    total += recs.length;
+    console.log(`batch ${round}: ${recs.length} event(s) on ${TOPIC} (total ${total})`);
+  }
+  if (total) {
+    console.log(`drained ${total} event(s) from ${TOPIC}; nothing further within ${wait}s`);
     return 0;
   }
   console.log(`nothing arrived on ${TOPIC} within ${wait}s`);
