@@ -1,0 +1,15 @@
+{
+  "message": {
+    "name": "spaces/AAAA1pNBS1A/messages/nT3wL8qYz4b.xK9vB2cDd3e",
+    "text": "did anyone check whether it was the sensor or the remote",
+    "createTime": "2026-11-25T02:18:04.004Z",
+    "thread": { "name": "spaces/AAAA1pNBS1A/threads/xK9vB2cDd3e" },
+    "sender": {
+      "name": "spaces/220188463205121849733",
+      "displayName": "Amy Beech",
+      "email": "amy.annisbrown@gmail.com",
+      "type": "HUMAN"
+    },
+    "space": { "name": "spaces/AAAA1pNBS1A", "spaceType": "ROOM" }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "message": {
+    "name": "spaces/AAAA1pNBS1A/messages/kQ7mZ2pXr1o.kQ7mZ2pXr1o",
+    "text": "the garage door has been open since this morning",
+    "createTime": "2026-11-25T02:15:38.113Z",
+    "sender": {
+      "name": "spaces/103902620694999538355",
+      "displayName": "Ed Beech",
+      "email": "initialed85@gmail.com",
+      "type": "HUMAN"
+    },
+    "space": { "name": "spaces/AAAA1pNBS1A", "spaceType": "ROOM" }
+  }
+}

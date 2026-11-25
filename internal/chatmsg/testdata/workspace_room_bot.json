@@ -1,0 +1,14 @@
+{
+  "message": {
+    "name": "spaces/AAAA1pNBS1A/messages/pR5jN0vBa7c.qS8tM1wCx2d",
+    "text": "👀",
+    "createTime": "2026-11-25T02:18:09.512Z",
+    "thread": { "name": "spaces/AAAA1pNBS1A/threads/qS8tM1wCx2d" },
+    "sender": {
+      "name": "users/103902620694999538355",
+      "displayName": "pi-chat",
+      "type": "BOT"
+    },
+    "space": { "name": "spaces/AAAA1pNBS1A", "spaceType": "ROOM" }
+  }
+}

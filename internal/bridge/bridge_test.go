@@ -102,6 +102,15 @@ func (f *fakeChat) Delete(_ context.Context, name string) error {
 	return nil
 }
 
+// GetSpace answers the routing question the room listener cannot answer from its own payload. The
+// default here is a group room, because that is the least surprising space for an app fake: a test
+// that wants a 1:1 says so by seeding ownedThreads-style data into spaces.
+func (f *fakeChat) GetSpace(_ context.Context, name string) (*chatapi.SpaceInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return &chatapi.SpaceInfo{Name: name, SpaceType: "ROOM"}, nil
+}
+
 // nameOf finds the first posted message with exactly this text, for asserting on bubbles.
 func (f *fakeChat) nameOf(text string) string {
 	f.mu.Lock()

@@ -74,6 +74,17 @@ type Event struct {
 	Command     string
 	CommandArgs string
 
+	// Source records which path delivered this event: "app" for the Chat app's own credential (only
+	// messages that tag the app, plus everything in a 1:1 with it) or "workspace" for the
+	// user-authorised room listener (everything the authorising human can see). Routing depends on it.
+	Source string
+	// SenderType is Google's own answer to "who wrote this": HUMAN, BOT or APP-GENERATED. Only the
+	// room listener carries it, and it is the loop guard for a listener that also receives the bot's
+	// replies.
+	SenderType string
+	// Type is the raw event type when one exists (the CloudEvents ce-type on the room listener).
+	Type string
+
 	Attachments  []Attachment
 	Locale       string
 	TimeZoneName string
@@ -185,7 +196,7 @@ func Parse(data []byte) (*Event, error) {
 		return nil, fmt.Errorf("decode chat event: %w", err)
 	}
 
-	ev := &Event{Raw: json.RawMessage(data)}
+	ev := &Event{Raw: json.RawMessage(data), Source: "app", Type: env.Type}
 	if env.Common != nil {
 		ev.Locale = env.Common.Locale
 		ev.TimeZoneName = env.Common.TZ.ID
@@ -260,6 +271,9 @@ func applyUser(ev *Event, u *wireUser) {
 	ev.UserID = u.Name
 	ev.UserEmail = u.Email
 	ev.UserDisplayName = u.DisplayName
+	if ev.SenderType == "" {
+		ev.SenderType = u.Type
+	}
 }
 
 func applyPayload(ev *Event, p *wirePayload) {
@@ -286,6 +300,7 @@ func applyMessage(ev *Event, m *wireMessage) {
 		applySpace(ev, m.Space)
 	}
 	if m.Sender != nil {
+		ev.SenderType = firstNonEmpty(m.Sender.Type, ev.SenderType)
 		ev.UserID = firstNonEmpty(m.Sender.Name, ev.UserID)
 		ev.UserDisplayName = firstNonEmpty(m.Sender.DisplayName, ev.UserDisplayName)
 		if m.Sender.Email != "" {

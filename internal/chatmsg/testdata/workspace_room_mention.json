@@ -1,0 +1,18 @@
+{
+  "message": {
+    "name": "spaces/AAAA1pNBS1A/messages/mD2hV6yLp9f.mD2hV6yLp9f",
+    "text": "@pi-chat what did the garage log say overnight",
+    "argumentText": " what did the garage log say overnight",
+    "createTime": "2026-11-25T02:19:11.220Z",
+    "annotations": [
+      { "type": "USER_MENTION", "length": 8, "startIndex": 0, "userMention": { "type": "MENTION", "user": { "name": "users/103902620694999538355", "displayName": "pi-chat", "type": "BOT" } } }
+    ],
+    "sender": {
+      "name": "spaces/103902620694999538355",
+      "displayName": "Ed Beech",
+      "email": "initialed85@gmail.com",
+      "type": "HUMAN"
+    },
+    "space": { "name": "spaces/AAAA1pNBS1A", "spaceType": "ROOM" }
+  }
+}

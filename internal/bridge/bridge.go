@@ -37,6 +37,9 @@ type Chat interface {
 	Delete(ctx context.Context, name string) error
 	DownloadMedia(ctx context.Context, resourceRef string, maxBytes int64) ([]byte, string, error)
 	HasBotMessage(ctx context.Context, space, thread string) (bool, error)
+	// GetSpace is how the room listener learns whether a space is a 1:1 or a group room: its own payload
+	// does not say, and the routing policy differs between the two.
+	GetSpace(ctx context.Context, name string) (*chatapi.SpaceInfo, error)
 }
 
 // Gateway is the slice of gateway.Client the bridge uses; faked in tests.
@@ -205,11 +208,12 @@ type Bridge struct {
 	mu          sync.Mutex
 	seen        map[string]struct{}
 	seenQ       []string
-	watches     map[string]*watch   // space -> in-flight watch, so /stop can reach it
-	delivered   map[string]bool     // gateway turn id -> its answer has already been posted
-	summaries   map[string]string   // thread -> <=30-word running summary for the reply gate
-	roomAnswers map[string]string   // space -> the last thing pi-chat said there, for the room gate
-	piThreads   map[string]struct{} // group threads where a message mentioned the app
+	watches     map[string]*watch             // space -> in-flight watch, so /stop can reach it
+	delivered   map[string]bool               // gateway turn id -> its answer has already been posted
+	summaries   map[string]string             // thread -> <=30-word running summary for the reply gate
+	roomAnswers map[string]string             // space -> the last thing pi-chat said there, for the room gate
+	piThreads   map[string]struct{}           // group threads where a message mentioned the app
+	spaces      map[string]*chatapi.SpaceInfo // space name -> Chat's own description of it, for routing
 	gate        chatgate.Classifier
 	lastSpace   string
 	watchers    sync.WaitGroup

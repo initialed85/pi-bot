@@ -36,6 +36,13 @@
 //	PI_CHAT_REPLY_GATE_TIMEOUT_SECONDS  classifier deadline for the first attempt (default 3)
 //	PI_CHAT_REPLY_GATE_ATTEMPT_MS       per-attempt deadlines, comma separated (default 3000,6000,12000)
 //	PI_CHAT_GATE_ROOM_ROOT       ignore|classify (default ignore): send untagged new room messages to the room classifier
+//	PI_CHAT_USER_LISTENER        off|on (default off): also consume the user-authorised room listener subscription
+//	PI_CHAT_USER_SUBSCRIPTION    Pub/Sub subscription fed by the Workspace Events listener (default pi-chat-user-events-sub)
+//	PI_CHAT_USER_TOPIC           the topic that listener publishes to, used when renewing (default pi-chat-user-events)
+//	PI_CHAT_USER_RENEW           on|off (default on when the listener is on): recreate the Workspace Events subscription on a timer
+//	PI_CHAT_USER_RENEW_MINUTES   renewal interval, must stay inside the measured ~4h subscription lifetime (default 180)
+//	PI_CHAT_USER_OAUTH_CLIENT_FILE  file holding {client_id, client_secret} for the human OAuth grant (default /etc/pi-chat-user/oauth-client.json)
+//	PI_CHAT_USER_OAUTH_TOKEN_FILE   file holding the refresh token, bare or {"refresh_token": …} (default /etc/pi-chat-user/refresh-token)
 //	PI_CHAT_LOG_LEVEL          debug|info|warn|error (default info)
 package main
 
@@ -56,6 +63,7 @@ import (
 	"cloud.google.com/go/pubsub"
 	"github.com/initialed85/pi-bot/internal/bridge"
 	"github.com/initialed85/pi-bot/internal/chatapi"
+	"github.com/initialed85/pi-bot/internal/chatevents"
 	"github.com/initialed85/pi-bot/internal/gateway"
 	"google.golang.org/api/option"
 )
@@ -70,6 +78,14 @@ type settings struct {
 	allowlist    []string
 	cfg          bridge.Config
 	logLevel     string
+
+	userListener        bool
+	userSubscription    string
+	userTopic           string
+	userRenew           bool
+	userRenewEvery      time.Duration
+	userOAuthClientFile string
+	userOAuthTokenFile  string
 }
 
 func main() {
@@ -128,7 +144,7 @@ func run() error {
 		"allowlist", strings.Join(s.allowlist, ","),
 		"maxChars", s.cfg.MaxChars)
 
-	errCh := make(chan error, 1)
+	errCh := make(chan error, 2)
 	go func() {
 		if err := sub.Receive(ctx, func(mctx context.Context, m *pubsub.Message) {
 			handleReceive(mctx, logger, b, m)
@@ -138,6 +154,29 @@ func run() error {
 		}
 		errCh <- nil
 	}()
+
+	// The room listener runs beside the app path, not instead of it. A failure here is deliberately not
+	// fatal: the app path still answers 1:1 messages and tagged room messages, and killing the pod over
+	// a listener Google may have simply expired would trade a working half for a broken whole. It is
+	// retried, and the renewal loop is what usually fixes it.
+	if s.userListener {
+		go receiveRoomListener(ctx, logger, client, s, b)
+		logger.Info("listening for room messages authorised by a human account",
+			"subscription", s.userSubscription,
+			"renew_every", s.userRenewEvery.String(),
+			"renewal", fmt.Sprintf("%v", s.userRenew))
+	}
+	if s.userListener && s.userRenew {
+		cred, err := chatevents.LoadCredential(s.userOAuthClientFile, s.userOAuthTokenFile)
+		if err != nil {
+			logger.Error("room listener credential unavailable; group rooms stay unanswered",
+				"client_file", s.userOAuthClientFile, "token_file", s.userOAuthTokenFile, "err", err)
+		} else {
+			renewer := chatevents.NewRenewer(cred, s.project, s.userTopic, s.userRenewEvery,
+				logger.With("component", "room-listener"))
+			go renewer.Run(ctx)
+		}
+	}
 
 	select {
 	case err := <-errCh:
@@ -165,6 +204,48 @@ func run() error {
 	_ = client.Close()
 	logger.Info("stopped")
 	return nil
+}
+
+// receiveRoomListener consumes the subscription that the human-authorised Workspace Events listener
+// feeds, and keeps trying: a Workspace Events subscription expires on its own schedule, so a Receive
+// failure is usually "the subscription went away between the renewal and now", which the renewal loop
+// resolves a few minutes later.
+func receiveRoomListener(ctx context.Context, logger *slog.Logger, client *pubsub.Client, s settings, b *bridge.Bridge) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		userSub := client.Subscription(s.userSubscription)
+		userSub.ReceiveSettings = pubsub.ReceiveSettings{
+			MaxExtension:  50 * time.Minute,
+			NumGoroutines: 1,
+		}
+		err := userSub.Receive(ctx, func(mctx context.Context, m *pubsub.Message) {
+			handleWorkspaceReceive(mctx, logger, b, m)
+		})
+		if ctx.Err() != nil {
+			return
+		}
+		logger.Error("room listener receive failed; app path unaffected",
+			"subscription", s.userSubscription, "err", err,
+			"hint", "check the subscription exists, the renewal is running, and the app service account has roles/pubsub.subscriber on it")
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(30 * time.Second):
+		}
+	}
+}
+
+func handleWorkspaceReceive(ctx context.Context, logger *slog.Logger, b *bridge.Bridge, m *pubsub.Message) {
+	// Acked whatever happens, for the same reason as the app path: an event that does not parse is not
+	// going to parse better on redelivery, and Pi failures are already reported into the thread.
+	if err := b.HandleWorkspace(ctx, m.ID, m.Attributes, m.Data); err != nil {
+		logger.Error("room listener event failed", "id", m.ID,
+			"attrs", truncate(fmt.Sprint(m.Attributes), 200),
+			"data", truncate(string(m.Data), 400), "err", err)
+	}
+	m.Ack()
 }
 
 func handleReceive(ctx context.Context, logger *slog.Logger, b *bridge.Bridge, m *pubsub.Message) {
@@ -281,6 +362,26 @@ func loadSettings() (settings, error) {
 	// outright unless this is set to "classify", in which case the room classifier decides whether
 	// answering would be an intrusion. Enforce answers in a new thread; dry-run only logs.
 	s.cfg.GateRoomRootUntagged = strings.EqualFold(envDefault("PI_CHAT_GATE_ROOM_ROOT", "ignore"), "classify")
+
+	// The room listener is a separate capability from the app path, and it is off by default: it reads
+	// every message in every space the authorising human belongs to, so enabling it is an explicit
+	// operator decision rather than a side effect of deploying a new image.
+	s.userListener = strings.EqualFold(envDefault("PI_CHAT_USER_LISTENER", "off"), "on")
+	s.userSubscription = envDefault("PI_CHAT_USER_SUBSCRIPTION", "pi-chat-user-events-sub")
+	s.userTopic = envDefault("PI_CHAT_USER_TOPIC", "pi-chat-user-events")
+	s.userRenew = !strings.EqualFold(envDefault("PI_CHAT_USER_RENEW", "on"), "off")
+	s.userRenewEvery = minutes("PI_CHAT_USER_RENEW_MINUTES", 180*time.Minute)
+	s.userOAuthClientFile = envDefault("PI_CHAT_USER_OAUTH_CLIENT_FILE", "/etc/pi-chat-user/oauth-client.json")
+	s.userOAuthTokenFile = envDefault("PI_CHAT_USER_OAUTH_TOKEN_FILE", "/etc/pi-chat-user/refresh-token")
+	if s.userRenewEvery < 30*time.Minute {
+		// Renewing every couple of minutes would churn a resource Google rate-limits, and it buys nothing.
+		s.userRenewEvery = 30 * time.Minute
+	}
+	if s.userRenewEvery > 3*time.Hour {
+		// The measured lifetime is ~4h from createTime; leaving 3h of headroom keeps a renewal from
+		// racing expiry.
+		s.userRenewEvery = 3 * time.Hour
+	}
 	s.cfg.Eyes = envDefault("PI_CHAT_EYES", s.cfg.Eyes)
 	s.cfg.Thinking = envDefault("PI_CHAT_THINKING", s.cfg.Thinking)
 	s.cfg.PollInterval = seconds("PI_CHAT_POLL_SECONDS", s.cfg.PollInterval)
