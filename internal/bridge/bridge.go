@@ -785,7 +785,9 @@ func (b *Bridge) replyGate(ctx context.Context, ev *chatmsg.Event, message strin
 	if mode == "dry-run" {
 		loggedAction = "dry-run-" + action
 	}
-	b.log.Info("reply gate", "thread", ev.Thread, "flow", flow, "prompt", prompt, "answer", answer, "latency_ms", time.Since(started).Milliseconds(), "action", loggedAction)
+	// user and space are on this line because reviewing a dry-run means answering "who would the bot have
+	// replied to, and where", and a room judgement with no author is not reviewable - it is a count.
+	b.log.Info("reply gate", "thread", ev.Thread, "space", ev.Space, "user", ev.UserEmail, "flow", flow, "prompt", prompt, "answer", answer, "latency_ms", time.Since(started).Milliseconds(), "action", loggedAction)
 	if flow == chatgate.FlowRoomRespond && mode != "enforce" {
 		// Dry-run measures the room classifier without putting new text in a shared room: a would-be
 		// room answer is logged and dropped, so reviewing the feature cannot itself be the noise.

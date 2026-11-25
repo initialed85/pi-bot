@@ -91,6 +91,9 @@ const rows = decisions.map((d) => {
   return {
     time: (d.time ?? "").slice(11, 19), thread: (d.thread ?? "").split("/").pop(),
     flow: d.flow, answer: d.answer, ms: d.latency_ms, action: d.action,
+    // Pre-2026-11-25 logs do not carry these; the room verdicts then have to be attributed by hand
+    // against the bridge's "room sender identified" line, which shares the thread.
+    by: d.user ? String(d.user).split("@")[0] : "", space: d.space ?? "",
     message: text.trim().slice(0, 70),
     suppresses: WOULD_SUPPRESS.has(d.action),
     failed: FAILED.has(d.action),
@@ -139,6 +142,25 @@ if (rerouted.length) {
 }
 const answered = rows.filter((r) => !r.suppresses && !r.reroutes).length;
 console.log(`   (${answered} answered in place)`);
+
+// The room flows are the ones that put text in front of other people, so they get their own breakdown by
+// person: an untagged message from one allowlisted person answering is a different decision from another.
+const room = rows.filter((r) => r.flow === "room-respond");
+if (room.length) {
+  const people = new Map();
+  for (const r of room) {
+    const k = r.by || "unattributed";
+    const p = people.get(k) ?? { would: [], silent: [] };
+    (r.suppresses ? p.silent : p.would).push(r);
+    people.set(k, p);
+  }
+  console.log(`\n== room-respond judgements, by person (dry-run: judged, never posted)`);
+  for (const [person, p] of people) {
+    console.log(`   ${person}: ${p.would.length} would answer, ${p.silent.length} would stay silent`);
+    for (const r of p.would) console.log(`     WOULD ANSWER [${r.time}] in ${r.space || "unknown space"}: "${r.message}"`);
+    for (const r of p.silent) console.log(`     silent     [${r.time}] "${r.message}"`);
+  }
+}
 const fb = rows.filter((r) => r.failed);
 if (fb.length) console.log(`   ${fb.length} classifier FAILURE(S)/timeout(s) - the gate did not decide; pre-retry logs answered those inline, current enforce silences them unless the message was a 1:1:\n` +
   fb.map((r) => `     [${r.time}] ${r.flow} -> ${r.action} after ${r.ms}ms`).join("\n"));
