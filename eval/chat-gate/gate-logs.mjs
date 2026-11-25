@@ -71,21 +71,26 @@ const rows = decisions.map((d) => {
   // The prompt is a rendered multi-line string; the message is the line after
   // the "Latest message..." header, up to the next blank line.
   const lines = String(d.prompt ?? "").split("\n");
-  // should-respond renders `Latest message from <who>:`; thread-request renders
-  // `Message: "..."` (which can wrap over lines); summary uses the should-respond shape.
-  const i = lines.findIndex((l) => /^Latest message/.test(l));
+  // The message line, whatever the prompt version. Live logs proved this extractor stale: the prompts
+  // now name the author on the same line (`Message (from a@b): "..."`), so a header-then-body reader
+  // found a header, then a blank line, and rendered an empty table - a review tool that shows no
+  // messages is worse than no review tool, because it looks like the gate judged nothing.
+  const startIdx = lines.findIndex((l) => /^(Latest message|Message)\b/.test(l.trim()));
   let text = "";
-  if (i >= 0) {
-    const body = [];
-    for (const l of lines.slice(i + 1)) { if (l.trim() === "") break; body.push(l.trim()); }
-    text = body.join(" ");
-  } else {
-    const m = lines.findIndex((l) => /^Message: "/.test(l));
-    if (m >= 0) {
-      const body = [];
-      for (const l of lines.slice(m)) { if (/^Answer with exactly/.test(l)) break; body.push(l.trim()); }
-      text = body.join(" ").replace(/^Message: "/, "").replace(/"$/, "");
+  let fromPrompt = "";
+  if (startIdx >= 0) {
+    const body = [lines[startIdx].trim()];
+    for (const l of lines.slice(startIdx + 1)) {
+      const t = l.trim();
+      if (t === "" || /^(Answer with exactly|Thread summary:|Pi-chat.s most recent)/.test(t)) break;
+      body.push(t);
     }
+    const joined = body.join(" ");
+    const quoted = joined.match(/"([\s\S]*)"/);
+    text = (quoted ? quoted[1] : joined.replace(/^[^:]*:\s*/, "")).trim();
+    // Attribution without waiting for a redeploy: the prompt carries the sender's email, and the
+    // deployed log line does not, so a per-person room review can be built from the prompt itself.
+    fromPrompt = joined.match(/\(from ([^)]+@[^)]+)\)/)?.[1] ?? "";
   }
   const s = lines.findIndex((l) => /^Thread summary:/.test(l));
   return {
@@ -93,7 +98,8 @@ const rows = decisions.map((d) => {
     flow: d.flow, answer: d.answer, ms: d.latency_ms, action: d.action,
     // Pre-2026-11-25 logs do not carry these; the room verdicts then have to be attributed by hand
     // against the bridge's "room sender identified" line, which shares the thread.
-    by: d.user ? String(d.user).split("@")[0] : "", space: d.space ?? "",
+    by: d.user ? String(d.user).split("@")[0] : fromPrompt.split("@")[0],
+    space: d.space ?? "",
     message: text.trim().slice(0, 70),
     suppresses: WOULD_SUPPRESS.has(d.action),
     failed: FAILED.has(d.action),
