@@ -158,3 +158,36 @@ volumeMounts:
   be shortened (currently 7 days) so unattended participant messages do not sit in the topic.
 - How many untagged messages a day actually arrive in the friends room: that number is the real
   measure of how noisy the room gate's false positives would be, and it is only knowable in dry-run.
+
+## 2026-11-25: the identity the fixtures promised is not what the listener ships
+
+Everything above records `message.sender` as `{ name, email, type }`, and the fixtures in
+`internal/chatmsg/testdata/` are written that way. Production disagrees. The deployed bridge logged, for
+every untagged room message Ed sent:
+
+```
+msg="room event" path=workspace space=spaces/AAAA1pNBS1A user="" sender_type=HUMAN position="room root, untagged"
+msg="rejected sender" email="" space=spaces/AAAA1pNBS1A
+```
+
+`sender.email` was absent. The suite stayed green the whole time because the fixtures assert what the
+parser was written to expect rather than what a delivery contained - the exact failure mode the "the
+field mask is not validated" note above warns about, committed anyway. Treat every fixture in that
+directory as a *claim*, and only the log line as a measurement.
+
+What is now in the code instead of an assumption:
+
+- `chatmsg` parses `sender.legacyId` and keeps the sender object as raw bytes (`Event.SenderRaw`), so a
+  message the bridge cannot identify still leaves a record of what Google actually sent:
+  `room message carries no identity the allowlist can use` with `sender_json=…`.
+- `Bridge.bindIdentity` / `resolveIdentity` learn the pairing between a Chat user id and an email from
+  the messages that *do* carry one - the @-mentions and DMs on the app credential - and use it for room
+  messages. A person who has never tagged the app since the last roll has no identity the room path can
+  use, and that is logged rather than guessed around. A display name is never permission.
+- `DefaultMask` now names the sender leaves (`message.sender.email`, `.displayName`, `.name`, `.type`) as
+  well as `message.sender`. Whether that is what removed the email is not known; it is a hedge, and the
+  diagnostic line above is what answers it.
+
+Consequence nobody should forget: the allowlist is written in **emails**, so even a perfectly identified
+Aaron or Daniel is refused unless Ed lists them. Room listening therefore needs a decision about what
+he actually authorised - the room, or himself - and that is his call, not a plumbing fix.

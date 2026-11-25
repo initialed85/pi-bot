@@ -65,6 +65,14 @@ type Event struct {
 	UserID          string
 	UserEmail       string
 	UserDisplayName string
+	// UserLegacyID is Chat's stable numeric user id (`UserProfile.legacyId`). It is the only identity a
+	// Workspace Events room listener reliably carries: the human-shaped UserProfile it ships has a legacy
+	// id and a display name and no email, while the app credential ships an email. The bridge uses one to
+	// name the other - see Bridge.bindIdentity.
+	UserLegacyID string
+	// SenderRaw is the sender object exactly as it arrived, kept for diagnosis. When identity resolution
+	// fails this is the only record of what Google actually sent, which beats arguing about the schema.
+	SenderRaw json.RawMessage
 	// IdentityMismatch flags the two disagreeing, which the bridge treats as a hard no: a bot that
 	// runs shell commands should not guess whose permissions apply.
 	IdentityMismatch bool
@@ -138,6 +146,7 @@ type wireUser struct {
 	Email       string `json:"email"`
 	DisplayName string `json:"displayName"`
 	Type        string `json:"type"`
+	LegacyID    string `json:"legacyId"`
 }
 
 type wireSpace struct {
@@ -152,17 +161,21 @@ type wireSpace struct {
 }
 
 type wireMessage struct {
-	Name         string           `json:"name"`
-	Thread       *wireThread      `json:"thread"`
-	Sender       *wireUser        `json:"sender"`
-	Space        *wireSpace       `json:"space"`
-	Text         string           `json:"text"`
-	ArgumentText string           `json:"argumentText"`
-	Annotations  []wireAnnotation `json:"annotations"`
-	Attachment   []wireAttachment `json:"attachment"`
-	SlashCommand json.RawMessage  `json:"slashCommand"`
-	Silent       bool             `json:"silent"`
-	CreateTime   string           `json:"createTime"`
+	Name   string      `json:"name"`
+	Thread *wireThread `json:"thread"`
+	// Sender is kept raw on purpose. Chat fills it differently on the two transports - the app puts an
+	// email in it, the room listener puts a legacyId and a displayName - and json cannot decode one key
+	// into two struct fields (it decodes it into neither). Decoding it by hand keeps the typed view and
+	// the original bytes, which is what identity resolution needs.
+	Sender       json.RawMessage `json:"sender"`
+	Space        *wireSpace      `json:"space"`
+	Text         string          `json:"text"`
+	ArgumentText string          `json:"argumentText"`
+	Annotations  []wireAnnotation
+	Attachment   []wireAttachment
+	SlashCommand json.RawMessage `json:"slashCommand"`
+	Silent       bool            `json:"silent"`
+	CreateTime   string          `json:"createTime"`
 }
 
 type wireThread struct {
@@ -271,6 +284,7 @@ func applyUser(ev *Event, u *wireUser) {
 	ev.UserID = u.Name
 	ev.UserEmail = u.Email
 	ev.UserDisplayName = u.DisplayName
+	ev.UserLegacyID = u.LegacyID
 	if ev.SenderType == "" {
 		ev.SenderType = u.Type
 	}
@@ -299,17 +313,24 @@ func applyMessage(ev *Event, m *wireMessage) {
 	if m.Space != nil {
 		applySpace(ev, m.Space)
 	}
-	if m.Sender != nil {
-		ev.SenderType = firstNonEmpty(m.Sender.Type, ev.SenderType)
-		ev.UserID = firstNonEmpty(m.Sender.Name, ev.UserID)
-		ev.UserDisplayName = firstNonEmpty(m.Sender.DisplayName, ev.UserDisplayName)
-		if m.Sender.Email != "" {
-			if ev.UserEmail != "" && !strings.EqualFold(ev.UserEmail, m.Sender.Email) {
-				ev.IdentityMismatch = true
-			}
-			ev.UserEmail = m.Sender.Email
-			if ev.UserDisplayName == "" {
-				ev.UserDisplayName = m.Sender.DisplayName
+	if len(ev.SenderRaw) == 0 && len(m.Sender) > 0 {
+		ev.SenderRaw = append(json.RawMessage(nil), m.Sender...)
+	}
+	if len(m.Sender) > 0 && string(m.Sender) != "null" {
+		var s wireUser
+		if err := json.Unmarshal(m.Sender, &s); err == nil {
+			ev.SenderType = firstNonEmpty(s.Type, ev.SenderType)
+			ev.UserID = firstNonEmpty(s.Name, ev.UserID)
+			ev.UserLegacyID = firstNonEmpty(s.LegacyID, ev.UserLegacyID)
+			ev.UserDisplayName = firstNonEmpty(s.DisplayName, ev.UserDisplayName)
+			if s.Email != "" {
+				if ev.UserEmail != "" && !strings.EqualFold(ev.UserEmail, s.Email) {
+					ev.IdentityMismatch = true
+				}
+				ev.UserEmail = s.Email
+				if ev.UserDisplayName == "" {
+					ev.UserDisplayName = s.DisplayName
+				}
 			}
 		}
 	}

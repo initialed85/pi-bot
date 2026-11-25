@@ -242,9 +242,14 @@ type Bridge struct {
 	roomAnswers map[string]string             // space -> the last thing pi-chat said there, for the room gate
 	piThreads   map[string]struct{}           // group threads where a message mentioned the app
 	spaces      map[string]*chatapi.SpaceInfo // space name -> Chat's own description of it, for routing
-	gate        chatgate.Classifier
-	lastSpace   string
-	watchers    sync.WaitGroup
+	// people maps a Chat user id (`users/<legacyId>`, or the bare legacyId) to an email. It is learned at
+	// runtime, not configured: a message that mentions the app arrives on the app credential with an email
+	// and on the room listener with only an id, so the tagged message teaches the bridge who the id is.
+	// Room answers therefore depend on a person having tagged the app at least once since the last roll.
+	people    map[string]string
+	gate      chatgate.Classifier
+	lastSpace string
+	watchers  sync.WaitGroup
 }
 
 type watch struct {
@@ -374,6 +379,7 @@ func (b *Bridge) Handle(ctx context.Context, id string, data []byte) error {
 		return nil
 	}
 	b.log.Info("event", "kind", ev.Kind, "space", ev.Space, "user", ev.UserEmail, "text", truncate(ev.Prompt(), 90), "atts", len(ev.Attachments))
+	b.bindIdentity(ev)
 
 	switch ev.Kind {
 	case chatmsg.KindAddedToSpace:
@@ -394,6 +400,63 @@ func (b *Bridge) Handle(ctx context.Context, id string, data []byte) error {
 		b.log.Warn("ignoring unknown event", "kind", ev.Kind)
 		return nil
 	}
+}
+
+// identityKeys returns every way this event names its human: the resource name, the bare legacy id, and
+// whichever of the two Chat happened to fill.
+func identityKeys(ev *chatmsg.Event) []string {
+	keys := make([]string, 0, 4)
+	for _, k := range []string{ev.UserID, ev.UserLegacyID} {
+		if k == "" {
+			continue
+		}
+		keys = append(keys, k)
+		if bare, ok := strings.CutPrefix(k, "users/"); ok && bare != "" {
+			keys = append(keys, bare)
+		}
+	}
+	return keys
+}
+
+// bindIdentity pairs a Chat user id with the email that arrived with it, for the benefit of the room
+// listener, whose sender object carries no email at all. Only a message that has an email can teach
+// this, so in practice the @-mentions and DMs are what populate the map: a person who has never tagged
+// the app since the last roll has no identity the room path can use, and that is stated in the log
+// rather than guessed around.
+func (b *Bridge) bindIdentity(ev *chatmsg.Event) {
+	if ev.UserEmail == "" {
+		return
+	}
+	keys := identityKeys(ev)
+	if len(keys) == 0 {
+		return
+	}
+	b.mu.Lock()
+	if b.people == nil {
+		b.people = map[string]string{}
+	}
+	for _, k := range keys {
+		b.people[k] = ev.UserEmail
+	}
+	b.mu.Unlock()
+}
+
+// resolveIdentity fills in the email a room message is missing from a binding learned earlier, and
+// reports which key matched so the log says where an identity came from instead of presenting a
+// inference as a fact.
+func (b *Bridge) resolveIdentity(ev *chatmsg.Event) (string, bool) {
+	if ev.UserEmail != "" {
+		return "", false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, k := range identityKeys(ev) {
+		if email, ok := b.people[k]; ok {
+			ev.UserEmail = email
+			return k, true
+		}
+	}
+	return "", false
 }
 
 func (b *Bridge) allowed(ev *chatmsg.Event) bool {

@@ -90,7 +90,7 @@ func appPathCopy(name, text, argument string) []byte {
 						"type":        "USER_MENTION",
 						"userMention": map[string]any{"type": "MENTION", "user": map[string]any{"name": "users/1", "type": "BOT"}},
 					}},
-					"sender": map[string]any{"email": "initialed85@gmail.com", "displayName": "Ed Beech", "type": "HUMAN"},
+					"sender": map[string]any{"name": "users/103902620694999538355", "legacyId": "103902620694999538355", "email": "initialed85@gmail.com", "displayName": "Ed Beech", "type": "HUMAN"},
 				},
 				"space": map[string]any{"name": "spaces/AAAA1pNBS1A", "spaceType": "ROOM"},
 			},
@@ -348,5 +348,78 @@ func TestHandleWorkspace_SpaceLookupFailureStillRoutesAsRoom(t *testing.T) {
 	}
 	if gw.promptCount() != 0 {
 		t.Fatalf("prompts = %d, want 0: the classifier said no", gw.promptCount())
+	}
+}
+
+// listenerUntaggedNoEmail builds a room-root untagged listener payload whose sender has a user id and a
+// display name and no email - what the deployed listener ships. Constructed from what the bridge logged
+// in production, not copied from a delivery.
+func listenerUntaggedNoEmail(messageID, legacyID, displayName, text string) []byte {
+	payload := map[string]any{
+		"message": map[string]any{
+			"name":   fmt.Sprintf("spaces/AAAA1pNBS1A/messages/%s.%s", messageID, messageID),
+			"text":   text,
+			"sender": map[string]any{"name": "users/" + legacyID, "legacyId": legacyID, "displayName": displayName, "type": "HUMAN"},
+		},
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		panic(err)
+	}
+	return raw
+}
+
+// TestHandleWorkspace_IdentityIsLearnedFromAMessageThatCarriedAnEmail is the fix for the defect measured
+// on 2026-11-25: every untagged room message was rejected with email="" because the listener's sender
+// object carries a user id and no email. A person who has tagged the app has already been seen with an
+// email on the app credential, so the bridge may use that pairing - and only that pairing.
+func TestHandleWorkspace_IdentityIsLearnedFromAMessageThatCarriedAnEmail(t *testing.T) {
+	gate := &fakeGate{answers: map[string]string{chatgate.FlowRoomRespond: "YES"}, errs: map[string]error{}}
+	b, _, gw := listenerBridge(Config{
+		RequireMentionInRooms: true,
+		GateRoomRootMode:      "enforce",
+		ReplyGateMode:         "enforce",
+		ReplyGate:             gate,
+	})
+
+	// First: a mention on the app credential, which is where the email comes from.
+	if err := b.Handle(context.Background(), "psm-mention", appPathCopy("spaces/AAAA1pNBS1A/messages/aA1.aA1", "@pi-chat are you there?", "are you there?")); err != nil {
+		t.Fatalf("app path: %v", err)
+	}
+	gw.settle(gw.lastPrompt().ID, "here")
+	b.Wait()
+
+	// Then: a different message, untagged, on the listener, with no email anywhere in it.
+	if err := b.HandleWorkspace(context.Background(), "psm-id", listenerAttrs,
+		listenerUntaggedNoEmail("eV9pS7nQa2r", "103902620694999538355", "Ed Beech", "how about this one?")); err != nil {
+		t.Fatalf("listener: %v", err)
+	}
+	if gw.promptCount() != 2 {
+		t.Fatalf("prompts = %d, want 2: the tagged message and then the room message once the id is known", gw.promptCount())
+	}
+	if prompt := gw.lastPrompt(); !strings.HasPrefix(prompt.Text, "Ed Beech <initialed85@gmail.com>:") {
+		t.Errorf("room prompt must name the resolved author, got %q", prompt.Text)
+	}
+}
+
+// TestHandleWorkspace_AnUnknownRoomIDIsNotAnswered keeps the allowlist in charge: a room message from a
+// user id the bridge has never seen with an email is not permission to run Pi, however confidently the
+// listener names the sender.
+func TestHandleWorkspace_AnUnknownRoomIDIsNotAnswered(t *testing.T) {
+	gate := &fakeGate{answers: map[string]string{chatgate.FlowRoomRespond: "YES"}, errs: map[string]error{}}
+	b, _, gw := listenerBridge(Config{
+		RequireMentionInRooms: true,
+		GateRoomRootMode:      "enforce",
+		ReplyGateMode:         "enforce",
+		ReplyGate:             gate,
+	})
+	if err := b.HandleWorkspace(context.Background(), "psm-stranger", listenerAttrs,
+		listenerUntaggedNoEmail("fB2qT6wXc9s", "220188463205121849733", "Aaron Somebody", "what do you reckon?")); err != nil {
+		t.Fatalf("listener: %v", err)
+	}
+	b.Wait()
+	if gw.promptCount() != 0 || len(gate.callsFor(chatgate.FlowRoomRespond)) != 0 {
+		t.Fatalf("prompts=%d gate calls=%d, want 0 and 0: a display name is not an allowlist entry",
+			gw.promptCount(), len(gate.callsFor(chatgate.FlowRoomRespond)))
 	}
 }

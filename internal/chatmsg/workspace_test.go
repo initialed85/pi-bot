@@ -168,3 +168,39 @@ func TestParseWorkspace_RejectsAnEventWithNothingInIt(t *testing.T) {
 		t.Fatal("expected an error on unparseable JSON")
 	}
 }
+
+// TestParseWorkspace_IdentityWithoutAnEmail pins the shape the live listener actually ships, which no
+// fixture in this directory does: sender carries a type, a display name and a user id, and no email.
+// The deployed bridge proved that on 2026-11-25 (every untagged room message was rejected with
+// email=""), while the fixtures - which carry an email - let the suite stay green the whole time.
+// This payload is constructed to match what the bridge logged, not copied from a delivery, so it pins
+// the parser's behaviour without pretending to be a captured event.
+func TestParseWorkspace_IdentityWithoutAnEmail(t *testing.T) {
+	body := []byte(`{"message":{` +
+		`"name":"spaces/AAAA1pNBS1A/messages/eV9pS7nQa2r.eV9pS7nQa2r",` +
+		`"text":"how about this one?",` +
+		`"sender":{"name":"users/103902620694999538355","legacyId":"103902620694999538355","displayName":"Ed Beech","type":"HUMAN"}` +
+		`}}`)
+	ev, err := ParseWorkspace(body, workspaceAttrs)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if ev.UserEmail != "" {
+		t.Errorf("email = %q, want empty: this shape carries none, and treating an id as permission would be a guess", ev.UserEmail)
+	}
+	if ev.UserID != "users/103902620694999538355" {
+		t.Errorf("user id = %q", ev.UserID)
+	}
+	if ev.UserLegacyID != "103902620694999538355" {
+		t.Errorf("legacy id = %q, want the number parsed out of sender", ev.UserLegacyID)
+	}
+	if ev.UserDisplayName != "Ed Beech" {
+		t.Errorf("display name = %q", ev.UserDisplayName)
+	}
+	if len(ev.SenderRaw) == 0 {
+		t.Error("sender raw not kept: when identity cannot be resolved this is the only record of what Google sent")
+	}
+	if !ev.HumanSender() {
+		t.Error("human sender misread")
+	}
+}

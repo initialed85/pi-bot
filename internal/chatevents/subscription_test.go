@@ -398,3 +398,14 @@ func TestRenewerIntervalIsClampedInsideTheSubscriptionLifetime(t *testing.T) {
 		t.Fatalf("interval = %s, want at or under the measured ~4h subscription lifetime", slow.Interval)
 	}
 }
+
+// TestDefaultMaskNamesTheIdentityFields guards the one field the room path cannot work without. A
+// subscription whose payload has a sender type but no email makes every untagged room message
+// unactionable, and the only symptom is a log line nobody reads.
+func TestDefaultMaskNamesTheIdentityFields(t *testing.T) {
+	for _, want := range []string{"message.sender", "message.sender.email", "message.sender.displayName", "message.sender.name", "message.text", "message.thread"} {
+		if !strings.Contains(DefaultMask, want) {
+			t.Errorf("DefaultMask missing %q: %s", want, DefaultMask)
+		}
+	}
+}

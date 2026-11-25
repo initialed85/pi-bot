@@ -22,6 +22,8 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 
 	"github.com/initialed85/pi-bot/internal/chatapi"
 	"github.com/initialed85/pi-bot/internal/chatmsg"
@@ -76,12 +78,45 @@ func (b *Bridge) HandleWorkspace(ctx context.Context, id string, attrs map[strin
 	// From here the message is the listener's alone: nobody tags the app in an ordinary room sentence,
 	// so this is the only copy pi-chat will ever see of it. Everything after this point is the same
 	// policy the gated app path runs - allowlist, room eligibility, the room classifier.
+	// Rule 4: identity. The room listener's sender object has no email, and the allowlist is written in
+	// emails, so a room message is only actionable if this person has been identified earlier by a
+	// message that carried one (a mention or a DM on the app credential).
+	if key, ok := b.resolveIdentity(ev); ok {
+		b.log.Info("room sender identified from a message that carried an email",
+			"id", key, "user", ev.UserEmail, "space", ev.Space)
+	}
+
 	b.log.Info("room event",
 		"path", "workspace", "space", ev.Space, "thread", ev.Thread,
 		"user", ev.UserEmail, "sender_type", ev.SenderType,
 		"position", messagePosition(ev),
 		"text", truncate(ev.Prompt(), 90), "atts", len(ev.Attachments))
+	if ev.UserEmail == "" {
+		// Log exactly what Google sent rather than guessing at a schema. This line is what turns "the
+		// listener has no identity" from an interpretation into a record.
+		b.log.Warn("room message carries no identity the allowlist can use",
+			"space", ev.Space, "message", shortID(ev.MessageName),
+			"user_name", ev.UserID, "legacy_id", ev.UserLegacyID,
+			"display_name", ev.UserDisplayName, "sender_json", truncate(compactJSON(ev.SenderRaw), 240))
+	}
 	return b.onMessage(ctx, ev)
+}
+
+// compactJSON flattens a raw JSON value onto one line for a log field, so the sender object a room
+// event carried is readable in one line instead of an unreadable escaped blob.
+func compactJSON(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return strings.Join(strings.Fields(string(raw)), " ")
+	}
+	out, err := json.Marshal(v)
+	if err != nil {
+		return strings.Join(strings.Fields(string(raw)), " ")
+	}
+	return string(out)
 }
 
 // spaceInfo caches one Chat space so the routing question "is this a 1:1 or a room" is answered by
