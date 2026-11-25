@@ -17,10 +17,11 @@ pod can exceed 15 s - keep the model warm in prod). During the hermes backfill w
 (until 2026-11-22) the same calls measured 3.7-5.1 s with timeouts; do not size the 2 s
 deadline from those numbers.
 
-Baseline added 2026-11-24: room-respond 36/37 (for-bot 12/12, human-to-human 15/16, hard 9/9),
-mean 197 ms. The single miss (rr-20) is a message that wonders about pi-chat *to another person*
-("did it ever tell us why it kept quiet") and answers YES. Room gating is off in the deployed
-config and cannot fire yet: untagged room messages do not arrive over the app credential.
+Baseline added 2026-11-24, re-run unchanged on 2026-11-25: room-respond 36/37 (for-bot 12/12,
+human-to-human 15/16, hard 9/9), mean 197-200 ms. The single miss (rr-20) is a message that wonders
+about pi-chat *to another person* ("did it ever tell us why it kept quiet") and answers YES. Room gating
+was off in the deployed config then; as of 2026-11-25 it runs in dry-run for room roots - the decisions
+are logged and not acted on, which is the point of the trial.
 
 Borderline cases are not reproducible: Gemma at temperature 0 flipped the same input
 between YES and NO on repeat runs while the GGUF server was batching with other traffic.
@@ -66,8 +67,12 @@ Bridge integration contract (for build-google-chat-bot):
   means "wrong tag name", not "the hook died" - check the pipeline (or `tags/latest`) before concluding
   that a build is missing. Pipelines so far include `#1224 ba7a711 -> sha256:c47596e5...` and `#1228
   ff1a6b0 -> sha256:a435a8b5...` (the build that fixed the room listener renewal).
-  What has NOT been verified is whether those pipelines run `go test ./...` / `go vet` for this repo or only
-  build and push. Until someone reads a pipeline log, treat the checks below as things you run yourself.
+  Whether CI verifies code is answerable from this repo rather than from a pipeline log - read
+  `.woodpecker/ci.yaml`: on every push to master and every PR it runs `go version`, `gofmt -l .` with a
+  hard `test -z "$(gofmt -l .)"` gate, `go vet ./...` and `go test -count=1 ./...` in `golang:1.27-alpine`,
+  then `npm run check` for the TypeScript gateway in `node:22-alpine`. `.woodpecker/build.yaml` is a
+  separate lane that only builds and pushes the image, tagging it `$CI_COMMIT_SHA` (which is why tags are
+  40 characters) and `latest`. So a green pipeline here does mean the Go suite ran.
 - The bridge embeds these prompts (`internal/chatgate/prompts/`, `go:embed`). **Prompt text is owned
   here.** Edit `prompts/*.md`, re-run the eval, then `node revendor.mjs` to copy them into the bridge.
   The authoritative equality check is `internal/chatgate/prompt_drift_test.go`: it fetches these files
