@@ -114,6 +114,9 @@ type fakeWorkspaceAPI struct {
 	existing string
 	created  int
 	expire   string
+	// createAsOperation reproduces what the live API actually does: the create response names a
+	// long-running operation and carries the subscription inside its response.
+	createAsOperation bool
 }
 
 func (f *fakeWorkspaceAPI) handler(t *testing.T) http.Handler {
@@ -145,13 +148,34 @@ func (f *fakeWorkspaceAPI) handler(t *testing.T) http.Handler {
 			}
 			f.created++
 			f.existing = fmt.Sprintf("subscriptions/chat-created-%d", f.created)
+			if f.createAsOperation {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"name": fmt.Sprintf("operations/op-%d", f.created),
+					"response": map[string]any{
+						"name":       f.existing,
+						"expireTime": f.expire,
+					},
+				})
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"name": f.existing, "expireTime": f.expire})
 		case r.Method == http.MethodDelete:
+			if strings.Contains(r.URL.Path, "/operations/") {
+				t.Errorf("delete targeted a long-running operation: %s", r.URL.Path)
+			}
 			if f.existing == "" || !strings.HasSuffix(r.URL.Path, f.existing) {
 				t.Errorf("delete of %q while existing is %q", r.URL.Path, f.existing)
 			}
 			f.existing = ""
 			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/operations/"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"done": true,
+				"response": map[string]any{
+					"name":       f.existing,
+					"expireTime": f.expire,
+				},
+			})
 		case r.Method == http.MethodGet:
 			_ = json.NewEncoder(w).Encode(map[string]any{"expireTime": f.expire})
 		default:
@@ -168,6 +192,27 @@ func newTestRenewer(t *testing.T, server *httptest.Server) *Renewer {
 	r.APIURL = server.URL + "/v1"
 	r.TokenURL = server.URL + "/token"
 	return r
+}
+
+// The production constant is the thing that broke in the cluster, and no fake could catch it: every
+// test supplied its own base ("<server>/v1"), while the shipped default already contained the
+// collection, so create POSTed to /v1/subscriptions/subscriptions and Google answered the front-door
+// 404 as HTML. This asserts the default itself, in the shape the calls actually build.
+func TestRenewerDefaultURLIsTheRealAPIsShape(t *testing.T) {
+	r := NewRenewer(Credential{ClientID: "c", ClientSecret: "s", RefreshToken: "t"}, "home-ops-513116", "pi-chat-user-events", 3*time.Hour, nil)
+	if got := r.api() + "/subscriptions"; got != "https://workspaceevents.googleapis.com/v1/subscriptions" {
+		t.Fatalf("create URL = %q, want the collection directly under /v1", got)
+	}
+	name := "projects/home-ops-513116/subscriptions/pi-chat-user-events"
+	if got := r.api() + "/" + name; got != "https://workspaceevents.googleapis.com/v1/"+name {
+		t.Fatalf("delete URL = %q", got)
+	}
+	if strings.Contains(strings.TrimSuffix(r.api(), "/v1"), "subscriptions") {
+		t.Fatalf("api base %q already contains the collection, which double-paths every call", r.api())
+	}
+	if r.tokenURL() != "https://oauth2.googleapis.com/token" {
+		t.Fatalf("token URL = %q", r.tokenURL())
+	}
 }
 
 func TestRenewFindsTheLiveSubscriptionThroughThe409AndReplacesIt(t *testing.T) {
@@ -209,6 +254,59 @@ func TestRenewFindsTheLiveSubscriptionThroughThe409AndReplacesIt(t *testing.T) {
 	}
 	if api.created != 1 {
 		t.Fatalf("subscriptions created = %d, want 1", api.created)
+	}
+}
+
+// The live API creates a subscription as a long-running operation. The renewer must remember the
+// subscription, never the operation, or every later renewal deletes a path that cannot exist and the
+// subscription quietly dies at its expiry.
+func TestRenewResolvesALongRunningCreateToTheSubscription(t *testing.T) {
+	api := &fakeWorkspaceAPI{expire: "2026-11-25T15:00:00Z", createAsOperation: true}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "at-op"})
+			return
+		}
+		api.handler(t).ServeHTTP(w, r)
+	}))
+	defer server.Close()
+
+	renewer := newTestRenewer(t, server)
+	expire, err := renewer.Renew(context.Background())
+	if err != nil {
+		t.Fatalf("first renew: %v", err)
+	}
+	if expire != api.expire {
+		t.Fatalf("expire = %q, want %q", expire, api.expire)
+	}
+	if strings.HasPrefix(renewer.name, "operations/") {
+		t.Fatalf("renewer remembered the operation %q instead of the subscription", renewer.name)
+	}
+	if renewer.name == "" {
+		t.Fatal("renewer did not resolve a subscription name from the operation")
+	}
+
+	// The second renewal is where the bug was fatal: it deletes what it remembered.
+	if _, err := renewer.Renew(context.Background()); err != nil {
+		t.Fatalf("second renew: %v", err)
+	}
+	api.mu.Lock()
+	requests := append([]string(nil), api.requests...)
+	api.mu.Unlock()
+	var deletes, creates int
+	for _, req := range requests {
+		switch {
+		case strings.HasPrefix(req, "DELETE"):
+			deletes++
+			if strings.Contains(req, "/operations/") {
+				t.Fatalf("deleted an operation: %s", req)
+			}
+		case strings.HasPrefix(req, "POST"):
+			creates++
+		}
+	}
+	if deletes != 1 || creates != 2 {
+		t.Fatalf("requests = %v, want create, delete, create", requests)
 	}
 }
 

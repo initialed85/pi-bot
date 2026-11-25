@@ -33,12 +33,18 @@ import (
 // DefaultShape is the subscription this deployment uses: every space the authorising human belongs to,
 // message-created events only, pushed to one topic.
 const (
-	DefaultTarget    = "//chat.googleapis.com/spaces/-"
-	DefaultEvent     = "google.workspace.chat.message.v1.created"
-	DefaultMask      = "message.name,message.text,message.sender,message.annotations,message.thread,message.space"
-	DefaultInterval  = 3 * time.Hour
-	tokenEndpoint    = "https://oauth2.googleapis.com/token"
-	subscriptionsAPI = "https://workspaceevents.googleapis.com/v1/subscriptions"
+	DefaultTarget   = "//chat.googleapis.com/spaces/-"
+	DefaultEvent    = "google.workspace.chat.message.v1.created"
+	DefaultMask     = "message.name,message.text,message.sender,message.annotations,message.thread,message.space"
+	DefaultInterval = 3 * time.Hour
+	tokenEndpoint   = "https://oauth2.googleapis.com/token"
+	// subscriptionsAPI is the API *base*, not the collection: create appends "/subscriptions" and
+	// delete/get append the subscription name. Getting this wrong is not loud - it POSTs to
+	// /v1/subscriptions/subscriptions, Google's front door answers with an HTML 404 page, and the only
+	// symptom is "decode create response: invalid character '<'". The unit tests always used a fake
+	// server whose base was "<url>/v1", so they could not catch a constant that already contained the
+	// collection. TestRenewerDefaultURLIsTheRealAPIsShape now pins the constant itself.
+	subscriptionsAPI = "https://workspaceevents.googleapis.com/v1"
 )
 
 // Credential is a human OAuth authorisation, read from files so nothing secret lives in the repo or in
@@ -216,8 +222,9 @@ func (r *Renewer) Renew(ctx context.Context) (string, error) {
 	}
 
 	name := r.name
-	if name == "" {
-		// Nothing to delete is also a fine outcome: create simply succeeds.
+	if name == "" || strings.HasPrefix(name, "operations/") {
+		// An operation name is never a subscription name, so it is treated as "we do not know the name"
+		// and rediscovered. Nothing to delete is also a fine outcome: create simply succeeds.
 		if created, err := r.create(ctx, token); err == nil {
 			r.name = created.name
 			return created.expire, nil
@@ -278,13 +285,20 @@ func (c Credential) accessToken(ctx context.Context, endpoint string) (string, e
 		return "", fmt.Errorf("chatevents: token refresh: %w", err)
 	}
 	defer res.Body.Close()
+	// Read first, decode second: a token endpoint that answers with an HTML page (which is what a
+	// consent or front-door failure looks like) must report the status and the first bytes, not just
+	// "invalid character '<'".
+	body, err := io.ReadAll(io.LimitReader(res.Body, 4096))
+	if err != nil {
+		return "", fmt.Errorf("chatevents: token refresh: read body: %w", err)
+	}
 	var payload struct {
 		AccessToken string `json:"access_token"`
 		Error       string `json:"error"`
 		ErrorDesc   string `json:"error_description"`
 	}
-	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
-		return "", fmt.Errorf("chatevents: token refresh: decode: %w", err)
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", fmt.Errorf("chatevents: token refresh (HTTP %d): decode: %w body=%q", res.StatusCode, err, strings.TrimSpace(string(body)))
 	}
 	if payload.AccessToken == "" {
 		return "", fmt.Errorf("chatevents: token refresh refused: %s %s", payload.Error, payload.ErrorDesc)
@@ -322,7 +336,7 @@ func (r *Renewer) create(ctx context.Context, token string) (createdSubscription
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(res.body, &resp); err != nil {
-		return createdSubscription{}, fmt.Errorf("chatevents: decode create response: %w", err)
+		return createdSubscription{}, fmt.Errorf("chatevents: decode create response (HTTP %d): %w body=%q", res.status, err, summarize(res.body))
 	}
 	if res.status >= 400 {
 		// A 409 is the one thing this API is generous about: the error metadata names the subscription
@@ -338,8 +352,24 @@ func (r *Renewer) create(ctx context.Context, token string) (createdSubscription
 		}
 		return createdSubscription{}, fmt.Errorf("chatevents: create: %d: %s", res.status, first(resp.Error.Message, summarize(res.body)))
 	}
-	name := first(resp.Name, resp.Response.Name)
+	name := first(resp.Response.Name, resp.Name)
 	expire := first(resp.ExpireTime, resp.Response.ExpireTime)
+	if strings.HasPrefix(name, "operations/") {
+		// Creating a subscription is long-running: the create response names the *operation*, and the
+		// subscription it built is inside that operation's response. A renewer that stores the operation
+		// name spends every later renewal trying to DELETE /v1/operations/..., which can never succeed,
+		// while the real subscription dies at its expiry. Measured on the live API: the create that
+		// worked returned name "operations/CksK..." and put the expiry in the response.
+		resolved, opExpire, err := r.resolveOperation(ctx, token, name)
+		if err != nil {
+			// Not fatal. An empty name means the next renewal rediscovers the live subscription through
+			// the 409 metadata, which is the discovery method this API actually supports.
+			r.Log.Warn("create returned an operation that did not resolve to a subscription name; the next renewal will rediscover it",
+				"operation", name, "err", err)
+			return createdSubscription{name: "", expire: first(expire, opExpire)}, nil
+		}
+		name, expire = resolved, first(expire, opExpire)
+	}
 	if name == "" {
 		return createdSubscription{}, fmt.Errorf("chatevents: create returned no subscription name (%s)", summarize(res.body))
 	}
@@ -352,7 +382,47 @@ func (r *Renewer) create(ctx context.Context, token string) (createdSubscription
 	return createdSubscription{name: name, expire: expire}, nil
 }
 
+// resolveOperation polls a long-running operation until it names the subscription it created.
+func (r *Renewer) resolveOperation(ctx context.Context, token, operation string) (string, string, error) {
+	for attempt := 0; attempt < 6; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return "", "", ctx.Err()
+			case <-time.After(2 * time.Second):
+			}
+		}
+		res, err := r.do(ctx, http.MethodGet, r.api()+"/"+operation, token, nil)
+		if err != nil {
+			return "", "", err
+		}
+		if res.status >= 400 {
+			return "", "", fmt.Errorf("chatevents: get operation %s: %d: %s", operation, res.status, summarize(res.body))
+		}
+		var op struct {
+			Done     bool `json:"done"`
+			Response struct {
+				Name       string `json:"name"`
+				ExpireTime string `json:"expireTime"`
+			} `json:"response"`
+		}
+		if err := json.Unmarshal(res.body, &op); err != nil {
+			return "", "", fmt.Errorf("chatevents: decode operation %s (HTTP %d): %w body=%q", operation, res.status, err, summarize(res.body))
+		}
+		if op.Response.Name != "" {
+			return op.Response.Name, op.Response.ExpireTime, nil
+		}
+		if op.Done {
+			return "", "", fmt.Errorf("chatevents: operation %s finished without naming a subscription (%s)", operation, summarize(res.body))
+		}
+	}
+	return "", "", fmt.Errorf("chatevents: operation %s did not finish within the renewal window", operation)
+}
+
 func (r *Renewer) delete(ctx context.Context, token, name string) error {
+	if strings.HasPrefix(strings.TrimSpace(name), "operations/") {
+		return fmt.Errorf("chatevents: refusing to delete %q: that is a long-running operation, not a subscription", name)
+	}
 	res, err := r.do(ctx, http.MethodDelete, r.api()+"/"+name, token, nil)
 	if err != nil {
 		return err
@@ -375,7 +445,7 @@ func (r *Renewer) get(ctx context.Context, token, name string) (string, error) {
 		ExpireTime string `json:"expireTime"`
 	}
 	if err := json.Unmarshal(res.body, &resp); err != nil {
-		return "", fmt.Errorf("chatevents: decode subscription: %w", err)
+		return "", fmt.Errorf("chatevents: decode subscription (HTTP %d): %w body=%q", res.status, err, summarize(res.body))
 	}
 	return resp.ExpireTime, nil
 }
