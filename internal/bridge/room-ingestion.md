@@ -189,5 +189,11 @@ What is now in the code instead of an assumption:
   diagnostic line above is what answers it.
 
 Consequence nobody should forget: the allowlist is written in **emails**, so even a perfectly identified
-Aaron or Daniel is refused unless Ed lists them. Room listening therefore needs a decision about what
-he actually authorised - the room, or himself - and that is his call, not a plumbing fix.
+Aaron or Daniel is refused unless Ed lists them.
+
+**Ed decided this on 2026-11-25, and it is settled:** the gate stays person-scoped to him and Amy -
+"don't want e.g. aaron to be able to be like hey give me all ed's bank transactions or whatever, at
+least not yet". That is not timidity, it is the correct boundary for a bridge that runs shell commands
+in Pi: an allowlist entry is a grant of *Ed's* permissions, so widening it to a whole room would let any
+person in that room drive this agent. Room-scoped authority is therefore a security decision to revisit
+only with Ed, deliberately, never as a convenience while debugging identity.
