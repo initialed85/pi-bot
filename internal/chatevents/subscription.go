@@ -35,12 +35,16 @@ import (
 const (
 	DefaultTarget = "//chat.googleapis.com/spaces/-"
 	DefaultEvent  = "google.workspace.chat.message.v1.created"
-	// DefaultMask names the sender object *and* its leaves. The mask was measured to be advisory (a field
-	// never named in it still arrived, and message.space never arrived although named), but on 2026-11-25
-	// the live subscription delivered a sender with a type and no email, which made every untagged room
-	// message unactionable. Naming the leaves is the cheap hedge: harmless if the mask is advisory,
-	// load-bearing if it turns out to be exact. Whether it changed anything is answered by the
-	// "room message carries no identity" log line, not by this comment.
+	// DefaultMask names the sender object *and* its leaves. Measured 2026-11-25T07:00Z on the deployed
+	// listener, which logs the sender object verbatim: it arrives as exactly
+	//   {"name":"users/<id>","type":"HUMAN"}
+	// - no email, no displayName, no legacyId - and widening this mask to name those leaves changed
+	// nothing. The mask is advisory; Google ships what it ships. The leaves are kept because stating the
+	// fields this code needs is more honest than implying the subscription provides them, and because it
+	// costs nothing. Identity therefore cannot come from the payload: it comes from messages that did
+	// carry an email (mentions and DMs on the app credential, whose captured payloads do contain
+	// "name":"users/<id>" alongside email and displayName), and nowhere else - chat.googleapis.com
+	// users.get answers 404 for this credential and spaces.members.list answers 403 insufficient scopes.
 	DefaultMask     = "message.name,message.text,message.sender,message.sender.name,message.sender.email,message.sender.displayName,message.sender.type,message.annotations,message.thread,message.space"
 	DefaultInterval = 3 * time.Hour
 	tokenEndpoint   = "https://oauth2.googleapis.com/token"
