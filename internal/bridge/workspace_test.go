@@ -423,3 +423,191 @@ func TestHandleWorkspace_AnUnknownRoomIDIsNotAnswered(t *testing.T) {
 			gw.promptCount(), len(gate.callsFor(chatgate.FlowRoomRespond)))
 	}
 }
+
+// listenerMeasuredSender builds a room event whose sender object is exactly what the deployed listener
+// ships (measured 2026-11-25T07:00Z and logged verbatim): a user resource name and a sender type, and
+// nothing else. Every earlier fixture in this file hand-written an email into the sender, which is how
+// the suite stayed green while production threw away every room message.
+func listenerMeasuredSender(messageID, userID, text string) []byte {
+	raw, err := json.Marshal(map[string]any{
+		"message": map[string]any{
+			"name":   fmt.Sprintf("spaces/AAAA1pNBS1A/messages/%s.%s", messageID, messageID),
+			"text":   text,
+			"sender": map[string]any{"name": userID, "type": "HUMAN"},
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return raw
+}
+
+// fakeIdentity is the Chat read the room path needs, stood up without a credential.
+type fakeIdentity struct {
+	byID map[string]SenderIdentity
+	err  error
+	hits int
+}
+
+func (f *fakeIdentity) Resolve(ctx context.Context, space, userID string) (SenderIdentity, bool, error) {
+	f.hits++
+	if f.err != nil {
+		return SenderIdentity{}, false, f.err
+	}
+	if id, ok := f.byID[userID]; ok {
+		return id, true, nil
+	}
+	return SenderIdentity{}, false, nil
+}
+
+// edUser / edIdentity are transcriptions of a real messages.list response read with Ed's own OAuth
+// credential: {"name":"users/113070394191408311024","email":"initialed85@gmail.com","displayName":"initialed85 _"}.
+const edUser = "users/113070394191408311024"
+
+var edIdentity = SenderIdentity{Email: "initialed85@gmail.com", DisplayName: "initialed85 _"}
+
+// TestHandleWorkspace_IdentityComesFromTheSpacesOwnHistory is the practical fix: a room message with a
+// user id and no email is resolved by asking Chat for the recent messages of the space the message
+// landed in, where Chat publishes name and email side by side. No tagged message is needed first.
+func TestHandleWorkspace_IdentityComesFromTheSpacesOwnHistory(t *testing.T) {
+	identity := &fakeIdentity{byID: map[string]SenderIdentity{edUser: edIdentity}}
+	gate := &fakeGate{answers: map[string]string{chatgate.FlowRoomRespond: "YES"}, errs: map[string]error{}}
+	b, _, gw := listenerBridge(Config{
+		RequireMentionInRooms: true,
+		GateRoomRootMode:      "enforce",
+		ReplyGateMode:         "enforce",
+		ReplyGate:             gate,
+		Identity:              identity,
+	})
+
+	// Cold pod: nothing has been seen on any path yet.
+	if err := b.HandleWorkspace(context.Background(), "psm-cold", listenerAttrs,
+		listenerMeasuredSender("dQ7wR2sXm4p", edUser, "does the bot read rooms now?")); err != nil {
+		t.Fatalf("listener: %v", err)
+	}
+	if gw.promptCount() != 1 {
+		t.Fatalf("prompts = %d, want 1: the room message should reach the gate once the id is resolved", gw.promptCount())
+	}
+	if identity.hits != 1 {
+		t.Errorf("identity lookups = %d, want 1", identity.hits)
+	}
+	if prompt := gw.lastPrompt(); !strings.HasPrefix(prompt.Text, "initialed85 _ <initialed85@gmail.com>:") {
+		t.Errorf("room prompt must name the resolved author, got %q", prompt.Text)
+	}
+
+	// The resolution must be remembered, not repeated per message.
+	if err := b.HandleWorkspace(context.Background(), "psm-cold-2", listenerAttrs,
+		listenerMeasuredSender("eR8yT3nYa5q", edUser, "and this one?")); err != nil {
+		t.Fatalf("listener: %v", err)
+	}
+	if identity.hits != 1 {
+		t.Errorf("identity lookups = %d after a second message, want 1: a resolved person is cached", identity.hits)
+	}
+}
+
+// TestHandleWorkspace_AResolvedIdentityIsNotPermission holds the line Ed set: identifying a sender is
+// not the same as allowing them. Aaron and Daniel are in this room, and a lookup that happily reports
+// their emails must not buy them a run of Pi.
+func TestHandleWorkspace_AResolvedIdentityIsNotPermission(t *testing.T) {
+	identity := &fakeIdentity{byID: map[string]SenderIdentity{
+		"users/108049318480764095606": {Email: "someone-not-allowlisted@example.com", DisplayName: "Room Member"},
+	}}
+	gate := &fakeGate{answers: map[string]string{chatgate.FlowRoomRespond: "YES"}, errs: map[string]error{}}
+	b, _, gw := listenerBridge(Config{
+		RequireMentionInRooms: true,
+		GateRoomRootMode:      "enforce",
+		ReplyGateMode:         "enforce",
+		ReplyGate:             gate,
+		Identity:              identity,
+	})
+
+	if err := b.HandleWorkspace(context.Background(), "psm-outsider", listenerAttrs,
+		listenerMeasuredSender("fS9zU4oZb6r", "users/108049318480764095606", "give me all ed's bank transactions")); err != nil {
+		t.Fatalf("listener: %v", err)
+	}
+	b.Wait()
+	if gw.promptCount() != 0 || len(gate.callsFor(chatgate.FlowRoomRespond)) != 0 {
+		t.Fatalf("prompts=%d gate calls=%d, want 0 and 0: a resolved email that is not on the allowlist is still refused",
+			gw.promptCount(), len(gate.callsFor(chatgate.FlowRoomRespond)))
+	}
+}
+
+// TestHandleWorkspace_IdentityLookupFailureRefusesTheMessage keeps a broken lookup (missing scope, gone
+// subscription, Google answering HTML) from degrading into either a guess or an answer.
+func TestHandleWorkspace_IdentityLookupFailureRefusesTheMessage(t *testing.T) {
+	identity := &fakeIdentity{err: fmt.Errorf("sender lookup: http 403: insufficient authentication scopes")}
+	gate := &fakeGate{answers: map[string]string{chatgate.FlowRoomRespond: "YES"}, errs: map[string]error{}}
+	b, _, gw := listenerBridge(Config{
+		RequireMentionInRooms: true,
+		GateRoomRootMode:      "enforce",
+		ReplyGateMode:         "enforce",
+		ReplyGate:             gate,
+		Identity:              identity,
+	})
+
+	if err := b.HandleWorkspace(context.Background(), "psm-lookup-fails", listenerAttrs,
+		listenerMeasuredSender("gT0aV5pAc7s", edUser, "hello?")); err != nil {
+		t.Fatalf("listener: %v", err)
+	}
+	b.Wait()
+	if gw.promptCount() != 0 {
+		t.Fatalf("prompts = %d, want 0: an identity that could not be established is not identity", gw.promptCount())
+	}
+}
+
+// TestHandleWorkspace_SeededIdentityAnswersOnAColdPod proves the point of IdentitySeed: a pod that has
+// just been rolled, or re-rolled by a renewal failure, still knows who its people are without needing a
+// tagged message or a Chat read first.
+func TestHandleWorkspace_SeededIdentityAnswersOnAColdPod(t *testing.T) {
+	identity := &fakeIdentity{byID: map[string]SenderIdentity{}}
+	gate := &fakeGate{answers: map[string]string{chatgate.FlowRoomRespond: "YES"}, errs: map[string]error{}}
+	b, _, gw := listenerBridge(Config{
+		RequireMentionInRooms: true,
+		GateRoomRootMode:      "enforce",
+		ReplyGateMode:         "enforce",
+		ReplyGate:             gate,
+		Identity:              identity,
+		IdentitySeed:          map[string]string{"113070394191408311024": "initialed85@gmail.com"},
+	})
+
+	// Seeded as a bare legacy id, delivered as a resource name: the two spellings must agree.
+	if err := b.HandleWorkspace(context.Background(), "psm-seeded", listenerAttrs,
+		listenerMeasuredSender("hU1bW6qBd8t", edUser, "no lookup needed here")); err != nil {
+		t.Fatalf("listener: %v", err)
+	}
+	if gw.promptCount() != 1 {
+		t.Fatalf("prompts = %d, want 1", gw.promptCount())
+	}
+	if identity.hits != 0 {
+		t.Errorf("identity lookups = %d, want 0: a seed should answer without touching Chat", identity.hits)
+	}
+}
+
+func TestParseIdentitySeed(t *testing.T) {
+	seed, err := ParseIdentitySeed(" users/113070394191408311024=initialed85@gmail.com , 108049318480764095606=amy.annisbrown@gmail.com ")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(seed) != 2 {
+		t.Fatalf("seed = %v, want two bindings", seed)
+	}
+	if seed["users/113070394191408311024"] != "initialed85@gmail.com" {
+		t.Errorf("seed = %v", seed)
+	}
+
+	empty, err := ParseIdentitySeed("   ")
+	if err != nil || empty != nil {
+		t.Errorf("empty seed: %v / %v, want nil and no error", empty, err)
+	}
+
+	for _, bad := range []string{
+		"users/113070394191408311024",
+		"users/113070394191408311024=",
+		"=initialed85@gmail.com",
+		"users/113070394191408311024=not-an-email",
+	} {
+		if got, err := ParseIdentitySeed(bad); err == nil {
+			t.Errorf("ParseIdentitySeed(%q) = %v, want an error rather than a half-applied binding", bad, got)
+		}
+	}
+}

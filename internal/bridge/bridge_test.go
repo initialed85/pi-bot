@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -1513,5 +1514,73 @@ func TestGroupThreadOwnershipSurvivesBridgeRestart(t *testing.T) {
 	second := New(chat, &fakeGateway{}, Config{ReplyGateMode: "dry-run", ReplyGate: &fakeGate{answers: map[string]string{}, errs: map[string]error{}}, RequireMentionInRooms: false}, nil)
 	if !second.groupMessageEligible(context.Background(), ev) {
 		t.Fatal("restarted bridge did not recover ownership from Chat history")
+	}
+}
+
+// TestWithDefaultsCarriesEveryConfigField is a guard against a bug class this package has now produced
+// twice: withDefaults starts from DefaultConfig() and rebuilds the config field by field, so adding a
+// field to Config without copying it here means every bridge that sets that field gets a zero value and
+// the feature quietly does nothing. Identity was dropped exactly that way - the room identity lookup was
+// configured, wired and unit-tested in isolation, and nil by the time the bridge used it.
+//
+// The test is deliberately annoying rather than clever: it fails if a new Config field is not exercised
+// with a non-zero value, because a fixture that leaves a field empty cannot notice it being dropped.
+func TestWithDefaultsCarriesEveryConfigField(t *testing.T) {
+	gate := &fakeGate{answers: map[string]string{}, errs: map[string]error{}}
+	identity := &fakeIdentity{byID: map[string]SenderIdentity{}}
+	in := Config{
+		Allowlist:             []string{"someone@example.com"},
+		RequireMentionInRooms: true,
+		GateRoomRootUntagged:  true,
+		GateRoomRootMode:      "enforce",
+		StatusMode:            "patch",
+		DeliverAs:             "followUp",
+		Eyes:                  "👀",
+		Thinking:              "🤔",
+		PollInterval:          10 * time.Millisecond,
+		MaxWait:               2 * time.Second,
+		MaxChars:              4000,
+		ImageMaxBytes:         1 << 20,
+		MaxImages:             2,
+		PrefixWithSender:      true,
+		ReplyGateMode:         "enforce",
+		ReplyGate:             gate,
+		ReplyGateEndpoint:     "http://127.0.0.1:1/v1/chat/completions",
+		ReplyGateModel:        "some/model",
+		Identity:              identity,
+		IdentitySeed:          map[string]string{"users/1": "someone@example.com"},
+		ReplyGateTimeout:      3 * time.Second,
+		ReplyGateAttempts:     []time.Duration{3 * time.Second},
+	}
+
+	out := in.withDefaults()
+
+	inValue := reflect.ValueOf(in)
+	outValue := reflect.ValueOf(out)
+	if inValue.NumField() != outValue.NumField() {
+		t.Fatalf("Config has %d fields and withDefaults returned %d", inValue.NumField(), outValue.NumField())
+	}
+	fields := reflect.TypeOf(in)
+	for i := 0; i < inValue.NumField(); i++ {
+		name := fields.Field(i).Name
+		if isZeroValue(inValue.Field(i)) {
+			t.Errorf("Config.%s is not exercised by this fixture: a copy dropped in withDefaults would go unnoticed. Set it to a non-zero value.", name)
+			continue
+		}
+		if isZeroValue(outValue.Field(i)) {
+			t.Errorf("Config.%s was set and came back empty: withDefaults dropped it", name)
+		}
+	}
+}
+
+func isZeroValue(v reflect.Value) bool {
+	if !v.IsValid() {
+		return true
+	}
+	switch v.Kind() {
+	case reflect.Slice, reflect.Map:
+		return v.Len() == 0
+	default:
+		return v.IsZero()
 	}
 }

@@ -197,3 +197,46 @@ least not yet". That is not timidity, it is the correct boundary for a bridge th
 in Pi: an allowlist entry is a grant of *Ed's* permissions, so widening it to a whole room would let any
 person in that room drive this agent. Room-scoped authority is therefore a security decision to revisit
 only with Ed, deliberately, never as a convenience while debugging identity.
+
+## 2026-11-25: how room identity is actually obtained, and the bug that hid it for a week
+
+The listener ships `{"name":"users/<id>","type":"HUMAN"}` and nothing else. The lookup that works, under
+the same human OAuth credential that renews the subscription, is the read this bridge already used for
+history review:
+
+```
+GET chat.googleapis.com/v1/spaces/<space>/messages?pageSize=25&fields=messages/name,messages/sender
+```
+
+Chat publishes `name` and `email` side by side there. Proven live against the real API, not against a
+fake server (`internal/chatevents/senders_live_test.go`):
+
+```
+PI_CHAT_REAL_PROBE=1 go test -count=1 -run LiveSenderLookup -v ./internal/chatevents
+  users/113070394191408311024 in spaces/AAAA1pNBS1A -> resolved   (one Chat read)
+  users/108049318480764095606 in spaces/AAAA1pNBS1A -> not resolved
+  users/108049318480764095606 in spaces/qi7VbgAAAAE -> resolved   (a different allowlisted person)
+```
+
+`internal/chatevents/senders.go` caches the pairing for a day, and a *miss* gets a five minute cooldown
+per (space, id) so an unallowlisted regular cannot cost one outbound call per message. Resolution order
+is: a runtime binding learned from a message that carried an email, then `PI_CHAT_ROOM_IDENTITY_SEED`,
+then the space-history read. All three fail closed, and `TestHandleWorkspace_AResolvedIdentityIsNotPermission`
+pins the boundary Ed set: a resolved email that is not on the allowlist is still refused.
+
+Two things worth remembering about how this stayed broken for a week:
+
+1. **Fixtures promised an email the transport never ships.** `internal/chatmsg/testdata/*.json` all hand
+   the sender an `email`, so `go test ./...` was green throughout. The line that finally told the truth
+   was the production log's `sender_json`.
+2. **`withDefaults` rebuilds Config field by field, and silently dropped the new one.** `Identity` was
+   set in `cmd/pi-bot`, unit tested in isolation, and nil by the time the bridge used it - the lookup
+   existed and was never called. `TestWithDefaultsCarriesEveryConfigField` now fails if any Config field
+   is not exercised with a non-zero value, so the class is caught rather than the instance.
+
+Scope consequence, stated plainly: the lookup reads recent messages in the space the message landed in,
+which is *no wider* than the subscription already is - that subscription delivers every message in those
+spaces to this process. Only identity fields are read and the text is discarded. It is still a broader
+reach than "the group room": a two-human DM (Chat reports `DIRECT_MESSAGE`, and `SpaceInfo.DM()` trusts
+`singleUserBotDm` instead, so it is routed like a room) is included, and an allowlisted person in one is
+resolvable there.

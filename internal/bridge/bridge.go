@@ -52,6 +52,20 @@ type Gateway interface {
 	Commands(ctx context.Context) ([]gateway.Command, error)
 }
 
+// SenderIdentity is what Chat published about a user id: the email the allowlist is written in, and the
+// name to put on a prompt so a shared session knows whose request it is honouring.
+type SenderIdentity struct {
+	Email       string
+	DisplayName string
+}
+
+// IdentityResolver is the lookup the room path needs and its own payload cannot provide. It is an
+// interface rather than a concrete client so the bridge can be tested without a Chat credential, and so
+// the resolver can be replaced if Google ever ships the email in the event after all.
+type IdentityResolver interface {
+	Resolve(ctx context.Context, space, userID string) (SenderIdentity, bool, error)
+}
+
 type Config struct {
 	// Allowlist is the set of sender emails permitted to drive Pi. Empty means deny everything: the
 	// bot is reachable by anyone Google lets add it to a space, so the default is closed.
@@ -118,7 +132,19 @@ type Config struct {
 	ReplyGate         chatgate.Classifier
 	ReplyGateEndpoint string
 	ReplyGateModel    string
-	ReplyGateTimeout  time.Duration
+
+	// Identity turns a room event's users/<id> into an email when the event carries none - which is all
+	// of them. Measured on the deployed listener (2026-11-25T07:00Z, logged verbatim): the sender object
+	// a room message ships is exactly {"name":"users/<id>","type":"HUMAN"}, while the allowlist is
+	// written in emails. Nil means room messages are only identifiable from a message that *did* carry an
+	// email (a mention or a 1:1) since this process started, which makes a freshly rolled pod deaf until
+	// somebody tags it.
+	Identity IdentityResolver
+	// IdentitySeed binds known user ids to emails at startup so identity survives a redeploy. Format is
+	// "users/<id>=email" or "<legacyId>=email", comma separated (see ParseIdentitySeed). Not a secret:
+	// a Chat user id is not a credential, and the email on the other side is already in the allowlist.
+	IdentitySeed     map[string]string
+	ReplyGateTimeout time.Duration
 	// ReplyGateAttempts is the per-attempt deadline schedule for one classification. Empty means
 	// chatgate's default, which doubles the first deadline: a slow call is almost always a cold
 	// model, and the attempt that wakes it up is not the attempt that should be timed out.
@@ -198,6 +224,13 @@ func (c Config) withDefaults() Config {
 	}
 	d.ReplyGateAttempts = c.ReplyGateAttempts
 	d.ReplyGate = c.ReplyGate
+	// Copied for the same reason as the bool above, and this pair is the reason that comment exists:
+	// withDefaults starts from DefaultConfig() and rebuilds field by field, so a field added to Config
+	// without a line here is silently nil in every bridge that sets it. Identity was dropped exactly that
+	// way and the room lookup looked like a no-op that did nothing. TestWithDefaultsCarriesEveryConfigField
+	// now catches the class rather than the instance.
+	d.Identity = c.Identity
+	d.IdentitySeed = c.IdentitySeed
 	// A bool has no sentinel to test against, so it is copied rather than defaulted: leaving it out
 	// silently drops the operator's setting.
 	d.GateRoomRootUntagged = c.GateRoomRootUntagged
@@ -301,6 +334,18 @@ func New(chat Chat, gw Gateway, cfg Config, log *slog.Logger) *Bridge {
 		piThreads:   map[string]struct{}{},
 		gate:        gate,
 	}
+	// Identity bindings are the one piece of state a redeploy otherwise loses, and the room path needs
+	// them from the very first message. Seeding them from config is what makes a cold pod able to answer
+	// a room at all; runtime learning (bindIdentity) still adds to it.
+	if len(resolved.IdentitySeed) > 0 {
+		b.people = map[string]string{}
+		for id, email := range resolved.IdentitySeed {
+			for _, key := range identityAliases(id) {
+				b.people[key] = email
+			}
+		}
+		b.log.Info("room identity seeded", "people", len(resolved.IdentitySeed))
+	}
 	if warmer, ok := gate.(interface{ Warm(context.Context) error }); ok {
 		go func() {
 			if err := warmer.Warm(context.Background()); err != nil {
@@ -403,17 +448,16 @@ func (b *Bridge) Handle(ctx context.Context, id string, data []byte) error {
 }
 
 // identityKeys returns every way this event names its human: the resource name, the bare legacy id, and
-// whichever of the two Chat happened to fill.
+// whichever of the two Chat happened to fill. It defers to identityAliases so a seed, a binding and a
+// lookup all agree on what "the same person" means - two hand-written lists of aliases is how those
+// three quietly stop agreeing.
 func identityKeys(ev *chatmsg.Event) []string {
 	keys := make([]string, 0, 4)
 	for _, k := range []string{ev.UserID, ev.UserLegacyID} {
 		if k == "" {
 			continue
 		}
-		keys = append(keys, k)
-		if bare, ok := strings.CutPrefix(k, "users/"); ok && bare != "" {
-			keys = append(keys, bare)
-		}
+		keys = append(keys, identityAliases(k)...)
 	}
 	return keys
 }
@@ -457,6 +501,127 @@ func (b *Bridge) resolveIdentity(ev *chatmsg.Event) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// roomIdentitySources name where an identity came from, so the log never presents an inference as a
+// fact read off the message.
+const (
+	identityFromTaggedMessage = "tagged-message"
+	identityFromSpaceHistory  = "space-message-history"
+	identityFromSeed          = "seed"
+)
+
+// resolveRoomIdentity fills in the email a room message is missing, in the cheapest order available:
+// a binding learned from a message that carried an email, then one configured at startup, then a read of
+// the space's own recent messages under the human credential that already authorises the listener.
+//
+// It fails closed and says so. A lookup that errors (scope missing, subscription gone, Google being
+// Google) must not be mistaken for "that person is unknown", and neither may be mistaken for permission.
+func (b *Bridge) resolveRoomIdentity(ctx context.Context, ev *chatmsg.Event) (string, string, bool) {
+	if ev.UserEmail != "" {
+		return "", "", false
+	}
+	if key, ok := b.resolveIdentity(ev); ok {
+		source := identityFromTaggedMessage
+		if b.seededIdentity(key, ev.UserEmail) {
+			source = identityFromSeed
+		}
+		return key, source, true
+	}
+
+	resolver := b.cfg.Identity
+	if resolver == nil {
+		return "", "", false
+	}
+	userID := ev.UserID
+	if userID == "" {
+		userID = ev.UserLegacyID
+		if userID != "" && !strings.HasPrefix(userID, "users/") {
+			userID = "users/" + userID
+		}
+	}
+	if userID == "" {
+		return "", "", false
+	}
+
+	identity, found, err := resolver.Resolve(ctx, ev.Space, userID)
+	if err != nil {
+		b.log.Warn("room identity lookup failed; the message is refused rather than guessed around",
+			"space", ev.Space, "id", userID, "err", err)
+		return userID, "", false
+	}
+	if !found || identity.Email == "" {
+		return userID, "", false
+	}
+
+	ev.UserEmail = identity.Email
+	if ev.UserDisplayName == "" {
+		ev.UserDisplayName = identity.DisplayName
+	}
+	b.bindIdentityKey(userID, identity.Email)
+	return userID, identityFromSpaceHistory, true
+}
+
+// bindIdentityKey records a pairing learned from a lookup so the next message from the same person costs
+// nothing.
+func (b *Bridge) bindIdentityKey(userID, email string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.people == nil {
+		b.people = map[string]string{}
+	}
+	for _, key := range identityAliases(userID) {
+		b.people[key] = email
+	}
+}
+
+func (b *Bridge) seededIdentity(key, email string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	seeded, ok := b.cfg.IdentitySeed[key]
+	return ok && seeded == email
+}
+
+// ParseIdentitySeed reads the "users/<id>=email,users/<otherId>=email" form an operator can put in an
+// environment variable or a manifest. Anything malformed is reported rather than half applied, because a
+// silently dropped binding shows up later as a room message being refused for no visible reason.
+func ParseIdentitySeed(raw string) (map[string]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	out := map[string]string{}
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		id, email, ok := strings.Cut(part, "=")
+		id, email = strings.TrimSpace(id), strings.TrimSpace(email)
+		if !ok || id == "" || email == "" || !strings.Contains(email, "@") {
+			return nil, fmt.Errorf("bridge: identity seed %q wants the form users/<id>=someone@example.com", part)
+		}
+		out[id] = email
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+// identityAliases returns both spellings a Chat user id arrives with, so a seed written one way matches a
+// message written the other.
+func identityAliases(userID string) []string {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return nil
+	}
+	out := []string{userID}
+	if bare, ok := strings.CutPrefix(userID, "users/"); ok && bare != "" {
+		out = append(out, bare)
+	} else if !strings.Contains(userID, "/") {
+		out = append(out, "users/"+userID)
+	}
+	return out
 }
 
 func (b *Bridge) allowed(ev *chatmsg.Event) bool {

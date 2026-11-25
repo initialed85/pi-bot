@@ -81,9 +81,8 @@ func (b *Bridge) HandleWorkspace(ctx context.Context, id string, attrs map[strin
 	// Rule 4: identity. The room listener's sender object has no email, and the allowlist is written in
 	// emails, so a room message is only actionable if this person has been identified earlier by a
 	// message that carried one (a mention or a DM on the app credential).
-	if key, ok := b.resolveIdentity(ev); ok {
-		b.log.Info("room sender identified from a message that carried an email",
-			"id", key, "user", ev.UserEmail, "space", ev.Space)
+	if key, source, ok := b.resolveRoomIdentity(ctx, ev); ok {
+		b.log.Info("room sender identified", "id", key, "via", source, "user", ev.UserEmail, "space", ev.Space)
 	}
 
 	b.log.Info("room event",
@@ -92,8 +91,9 @@ func (b *Bridge) HandleWorkspace(ctx context.Context, id string, attrs map[strin
 		"position", messagePosition(ev),
 		"text", truncate(ev.Prompt(), 90), "atts", len(ev.Attachments))
 	if ev.UserEmail == "" {
-		// Log exactly what Google sent rather than guessing at a schema. This line is what turns "the
-		// listener has no identity" from an interpretation into a record.
+		// Log exactly what Google sent rather than guessing at a schema, including the id that the lookup
+		// tried. This line is what turns "the listener has no identity" from an interpretation into a
+		// record, and it is the line that proved the sender object is {"name":"users/<id>","type":"HUMAN"}.
 		b.log.Warn("room message carries no identity the allowlist can use",
 			"space", ev.Space, "message", shortID(ev.MessageName),
 			"user_name", ev.UserID, "legacy_id", ev.UserLegacyID,

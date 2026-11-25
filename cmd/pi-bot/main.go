@@ -44,6 +44,7 @@
 //	PI_CHAT_USER_OAUTH_CLIENT_FILE  file holding the client id, or one installed-client JSON file with both id and secret (default /etc/pi-chat-user-oauth/client_id)
 //	PI_CHAT_USER_OAUTH_SECRET_FILE  file holding the client secret when the client id arrived on its own (default /etc/pi-chat-user-oauth/client_secret)
 //	PI_CHAT_USER_OAUTH_TOKEN_FILE   file holding the refresh token, bare or {"refresh_token": …} (default /etc/pi-chat-user-oauth/refresh_token)
+//	PI_CHAT_ROOM_IDENTITY_SEED comma separated "users/<id>=someone@example.com" bindings that survive a redeploy (default empty). Not a secret: a Chat user id is not a credential, and the email is already in PI_CHAT_ALLOWLIST.
 //	PI_CHAT_LOG_LEVEL          debug|info|warn|error (default info)
 package main
 
@@ -88,6 +89,10 @@ type settings struct {
 	userOAuthClientFile string
 	userOAuthSecretFile string
 	userOAuthTokenFile  string
+	// identitySeed binds known Chat user ids to allowlist emails at startup. The room listener ships a
+	// user id and no email, and this process forgets everything it learned about ids on every redeploy;
+	// a seed is what keeps a freshly rolled pod able to answer a room at all.
+	identitySeed map[string]string
 }
 
 func main() {
@@ -113,6 +118,26 @@ func run() error {
 		return err
 	}
 	gw := gateway.New(s.gatewayURL, s.gatewayToken)
+
+	// The room listener's payload ships a user id and no email - measured on the deployed listener, where
+	// the sender object is exactly {"name":"users/<id>","type":"HUMAN"} - so the same human credential
+	// that renews the subscription is also what turns that id into an allowlist email. It is loaded here,
+	// before the bridge exists, because the resolver is a construction-time dependency, and a bridge that
+	// cannot resolve identity is not broken, just deaf in group rooms: that stays a warning, not a fatal.
+	var roomCred chatevents.Credential
+	haveRoomCred := false
+	if s.userListener {
+		cred, err := chatevents.LoadCredential(s.userOAuthClientFile, s.userOAuthSecretFile, s.userOAuthTokenFile)
+		if err != nil {
+			logger.Error("room listener credential unavailable; group rooms stay unanswered",
+				"client_file", s.userOAuthClientFile, "token_file", s.userOAuthTokenFile, "err", err)
+		} else {
+			roomCred, haveRoomCred = cred, true
+			s.cfg.Identity = identityLookup{lookup: chatevents.NewSenderLookup(cred, logger.With("component", "room-identity"))}
+		}
+	}
+	s.cfg.IdentitySeed = s.identitySeed
+
 	b := bridge.New(chat, gw, s.cfg, logger.With("component", "bridge"))
 
 	if err := awaitGateway(ctx, gw, logger); err != nil {
@@ -168,16 +193,10 @@ func run() error {
 			"renew_every", s.userRenewEvery.String(),
 			"renewal", fmt.Sprintf("%v", s.userRenew))
 	}
-	if s.userListener && s.userRenew {
-		cred, err := chatevents.LoadCredential(s.userOAuthClientFile, s.userOAuthSecretFile, s.userOAuthTokenFile)
-		if err != nil {
-			logger.Error("room listener credential unavailable; group rooms stay unanswered",
-				"client_file", s.userOAuthClientFile, "token_file", s.userOAuthTokenFile, "err", err)
-		} else {
-			renewer := chatevents.NewRenewer(cred, s.project, s.userTopic, s.userRenewEvery,
-				logger.With("component", "room-listener"))
-			go renewer.Run(ctx)
-		}
+	if s.userListener && s.userRenew && haveRoomCred {
+		renewer := chatevents.NewRenewer(roomCred, s.project, s.userTopic, s.userRenewEvery,
+			logger.With("component", "room-listener"))
+		go renewer.Run(ctx)
 	}
 
 	select {
@@ -212,6 +231,17 @@ func run() error {
 // feeds, and keeps trying: a Workspace Events subscription expires on its own schedule, so a Receive
 // failure is usually "the subscription went away between the renewal and now", which the renewal loop
 // resolves a few minutes later.
+// identityLookup adapts the Chat-backed sender lookup to the bridge's own interface, so the bridge never
+// imports the subscription package or a Google client just to ask who a user id belongs to.
+type identityLookup struct {
+	lookup *chatevents.SenderLookup
+}
+
+func (i identityLookup) Resolve(ctx context.Context, space, userID string) (bridge.SenderIdentity, bool, error) {
+	identity, found, err := i.lookup.Resolve(ctx, space, userID)
+	return bridge.SenderIdentity{Email: identity.Email, DisplayName: identity.DisplayName}, found, err
+}
+
 func receiveRoomListener(ctx context.Context, logger *slog.Logger, client *pubsub.Client, s settings, b *bridge.Bridge) {
 	for {
 		if ctx.Err() != nil {
@@ -391,6 +421,13 @@ func loadSettings() (settings, error) {
 		// racing expiry.
 		s.userRenewEvery = 3 * time.Hour
 	}
+	// A malformed seed is fatal on purpose. A silently dropped binding shows up hours later as a room
+	// message being refused for no visible reason, which is the worst possible time to discover a typo.
+	seed, err := bridge.ParseIdentitySeed(envDefault("PI_CHAT_ROOM_IDENTITY_SEED", ""))
+	if err != nil {
+		return s, err
+	}
+	s.identitySeed = seed
 	s.cfg.Eyes = envDefault("PI_CHAT_EYES", s.cfg.Eyes)
 	s.cfg.Thinking = envDefault("PI_CHAT_THINKING", s.cfg.Thinking)
 	s.cfg.PollInterval = seconds("PI_CHAT_POLL_SECONDS", s.cfg.PollInterval)
