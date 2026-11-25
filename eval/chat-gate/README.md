@@ -173,21 +173,24 @@ always answered and the `thread-request` gate fires only for unmentioned ones.
 credential (the same one that authorises the Workspace Events subscription) and runs the shipped
 `room-respond` prompt over each untagged root. Staged test messages are performative - people write
 differently when measured - so real history is the better sample, and it needs nobody to perform.
+The tool prints one row per human message it can see, including ones it skips, so the counts below add
+up to 20 rather than to 5.
 
 Measured against the friends room `spaces/AAAA1pNBS1A`:
 
 - `spaces.messages.list` returns **200** under the user credential (23 messages, 2023-02-27 to today)
   while the same read is 403 for the Chat app credential. The refusal documented above is a property
   of the *app*, not of the room.
-- 20 untagged human messages, of which **4 were room roots** the gate would be consulted on
-  (Ed x3, Aaron x1, Daniel x1 across the room's life). Every one came back **NO** - including Ed's
-  2026-11-25 "test outside of thread" and his 2023 wall of text about a Hitachi contract. Aaron's and
-  Daniel's messages were judged with their real text and only the *printed* form is redacted: redaction
-  belongs on the output, not on the judgement, or the verdict describes nothing.
-- The remaining 16 rows were skipped by the bridge's own predicates: 13 inside a thread (enforce path
+- 23 messages in the room, of which 3 were the bot's own. Of the 20 human messages: **5 were room roots**
+  the gate would be consulted on (Ed x3, Aaron x1, Daniel x1, spread across the room's life since
+  2023) and every one came back **NO** - including Ed's 2026-11-25 "test outside of thread" and his
+  2023 wall of text about a Hitachi contract. Aaron's and Daniel's messages were judged with their real
+  text and only the *printed* form is redacted: redaction belongs on the output, not on the judgement,
+  or the verdict describes nothing.
+- The other 15 rows were skipped by the bridge's own predicates: 12 inside a thread (enforce path
   answers nothing), 3 addressed to the app (app path answers without consulting the gate).
 
-The honest limit: **real history contains no positive sample.** Four out of four NO tells us the gate
+The honest limit: **real history contains no positive sample.** Five out of five NO tells us the gate
 does not chase people who are not asking; it says nothing about whether it would suppress something
 worth answering, because nothing in that room's history ever was. Positives still come from the staged
 dataset (`dataset/room-respond.jsonl`) and from live dry-run traffic, which is why dry-run stays on.

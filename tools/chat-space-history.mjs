@@ -192,7 +192,10 @@ async function main() {
       rows.push({ ...m, verdict: `gate error: ${err.message}` });
     }
   }
-  console.log(`\njudged ${rows.length} untagged human messages`);
+  const judged = rows.filter((r) => !String(r.verdict).startsWith('skipped')).length;
+  const threaded = rows.filter((r) => String(r.verdict).startsWith('skipped: inside a thread')).length;
+  const mentioned = rows.filter((r) => String(r.verdict).startsWith('skipped: addressed')).length;
+  console.log(`\n${rows.length} human messages read: ${judged} judged by the gate, ${threaded} in-thread (no gate), ${mentioned} addressed to the app (no gate)`);
   console.log(`prompt: ${PROMPT_FILE}\ngate: ${GATE} model: ${MODEL} max_tokens=4 temperature=0 (the shipped request shape)`);
   for (const r of rows) {
     console.log(`\n${r.createTime}  ${r.sender}\n  ${r.shown}\n  -> ${r.verdict}`);
