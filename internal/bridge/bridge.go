@@ -295,6 +295,11 @@ type watch struct {
 	thread   string
 	replyID  string // deterministic client- id, so a redelivery cannot fork a second reply
 	statusID string // likewise for the status bubble, so a redelivery reuses the one already up
+
+	// queued is how long the session took to start on the prompt after the bridge dispatched it. It is
+	// the part of "after" that no amount of model speed can fix, so it gets its own number instead of
+	// hiding inside the total.
+	queued time.Duration
 }
 
 func New(chat Chat, gw Gateway, cfg Config, log *slog.Logger) *Bridge {
@@ -376,6 +381,11 @@ func (b *Bridge) SeenLen() int {
 }
 
 const dedupeWindow = 4096
+
+// queuePatience is how many answering budgets a single watch may span. One budget is spent waiting in
+// the gateway queue, and the full one is re-armed when the run actually starts; this is the ceiling on
+// a prompt that never starts at all.
+const queuePatience = 3
 
 // glyphOrNone maps the explicit "off" spellings of a status glyph to a disabled glyph.
 func glyphOrNone(v string) string {
@@ -998,15 +1008,21 @@ func (b *Bridge) forget(space string) {
 func (b *Bridge) watch(base context.Context, w *watch, start time.Time) {
 	defer b.forget(w.space)
 
-	poll, cancelPoll := context.WithTimeout(base, b.cfg.MaxWait)
+	poll, cancelPoll := context.WithTimeout(base, b.cfg.MaxWait*queuePatience)
 	defer cancelPoll()
 
 	ticker := time.NewTicker(b.cfg.PollInterval)
 	defer ticker.Stop()
 
+	// The answering budget belongs to the run, and starts when the run starts. A prompt sitting in the
+	// gateway queue while earlier turns finish is not this turn working.
+	deadline := start.Add(b.cfg.MaxWait)
+
 	bubble := b.openStatus(w)
 	thinkingShown := false
 	failures := 0
+	started := false
+	queuedNotice := false
 
 	for {
 		select {
@@ -1017,7 +1033,13 @@ func (b *Bridge) watch(base context.Context, w *watch, start time.Time) {
 			return
 		case <-poll.Done():
 			if base.Err() == nil {
-				b.setStatus(w, bubble, fmt.Sprintf("⌛️ Still working, but I stopped watching after %s. Pi may still be running - send /status to check, or /stop to abort it.", b.cfg.MaxWait))
+				if !started {
+					b.setStatus(w, bubble, fmt.Sprintf("⌛️ Pi has not started on that in %s - it is queued behind other work. Send it again, or send /stop to clear the queue.", humanDuration(b.cfg.MaxWait*queuePatience)))
+					b.log.Warn("queued turn never started", "turn", w.turnID, "waited", humanDuration(b.cfg.MaxWait*queuePatience))
+				} else {
+					b.setStatus(w, bubble, fmt.Sprintf("⌛️ Stopped watching after %s. Pi may still be running - send /status to check, or /stop to abort it.", humanDuration(b.cfg.MaxWait*queuePatience)))
+					b.log.Warn("stopped watching after the patience ceiling", "turn", w.turnID, "after", humanDuration(time.Since(start)), "queued", humanDuration(w.queued))
+				}
 			}
 			return
 		case <-ticker.C:
@@ -1041,9 +1063,35 @@ func (b *Bridge) watch(base context.Context, w *watch, start time.Time) {
 		}
 		failures = 0
 
+		// A queued prompt reads as a turn that exists but has not started. Separating that wait from the
+		// run is the only way to tell "the model is slow" from "one busy session is serialising every
+		// Chat message behind itself", which is what a 10 minute Chat answer actually is.
+		if !started && turn.Status == "running" {
+			started = true
+			w.queued = time.Since(start)
+			// The run has its own full budget from here. A message that queued behind two long turns would
+			// otherwise pick up the ⌛️ notice before the agent had done anything, and its real answer would
+			// arrive with nobody left to post it.
+			deadline = time.Now().Add(b.cfg.MaxWait)
+			b.log.Info("agent started the turn", "turn", w.turnID, "waited", humanDuration(w.queued))
+		}
+
 		if turn.Settled() {
 			b.finish(w, bubble, turn, time.Since(start))
 			return
+		}
+
+		if started && time.Now().After(deadline) {
+			b.setStatus(w, bubble, fmt.Sprintf("⌛️ Still working, but I stopped watching after %s. Pi may still be running - send /status to check, or /stop to abort it.", b.cfg.MaxWait))
+			b.log.Warn("turn outlived the watching deadline", "turn", w.turnID, "after", humanDuration(time.Since(start)), "queued", humanDuration(w.queued))
+			return
+		}
+		if !started && !queuedNotice && time.Since(start) > b.cfg.MaxWait {
+			// Better than a bubble that claims work which has not happened.
+			queuedNotice = true
+			b.setStatus(w, bubble, "⏳ Pi has not started on that yet - it is queued behind other work. Send /stop to clear the queue, or message again.")
+			b.log.Info("turn still queued", "turn", w.turnID, "waited", humanDuration(time.Since(start)))
+			continue
 		}
 		thinkingShown = b.showThinking(w, bubble, thinkingShown)
 	}
@@ -1130,7 +1178,8 @@ func (b *Bridge) finish(w *watch, bubble string, turn gateway.Turn, elapsed time
 		}
 		b.log.Debug("status bubble retired", "turn", w.turnID, "name", bubble)
 	}
-	b.log.Info("replied", "turn", w.turnID, "status", turn.Status, "chars", len(text), "after", humanDuration(elapsed))
+	b.log.Info("replied", "turn", w.turnID, "status", turn.Status, "chars", len(text),
+		"after", humanDuration(elapsed), "queued", humanDuration(w.queued), "worked", humanDuration(elapsed-w.queued))
 }
 
 // deliverAnswer writes the model's text into the thread. Chunking is forced by Chat's 32,000 character

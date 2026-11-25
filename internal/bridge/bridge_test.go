@@ -1573,6 +1573,103 @@ func TestWithDefaultsCarriesEveryConfigField(t *testing.T) {
 	}
 }
 
+// A ten minute Chat answer is usually not the model's fault: the prompt queued behind the run already
+// going. The two waits have to be separate numbers in the log, or nobody can act on either one.
+func TestWatch_LogsQueueWaitSeparatelyFromAgentWork(t *testing.T) {
+	var logs bytes.Buffer
+	chat := &fakeChat{downloads: map[string][]byte{}}
+	gw := &fakeGateway{turns: map[string]gateway.Turn{}, state: gateway.State{Idle: true, Model: "rooter/test-model"}}
+	cfg := fastConfig()
+	cfg.PollInterval = 20 * time.Millisecond
+	b := New(chat, gw, cfg, slog.New(slog.NewTextHandler(&logs, nil)))
+
+	raw := withText(t, fixtureBytes(t, "dm_message.json"), "how long does this take")
+	if err := b.Handle(context.Background(), "id-queue", raw); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	id := gw.lastPrompt().ID
+
+	// The gateway holds a follow-up as "queued" until the session is idle, then runs it, then settles it.
+	gw.setTurn(id, gateway.Turn{ID: id, Status: "queued"})
+	time.Sleep(90 * time.Millisecond)
+	gw.setTurn(id, gateway.Turn{ID: id, Status: "running", Turns: 1})
+	time.Sleep(90 * time.Millisecond)
+	gw.setTurn(id, gateway.Turn{ID: id, Status: "settled", Text: "not long"})
+	b.Wait()
+
+	out := logs.String()
+	if !strings.Contains(out, "agent started the turn") {
+		t.Fatalf("the moment the session picked it up was never logged: %q", out)
+	}
+	line := logLineWith(out, "replied")
+	if line == "" {
+		t.Fatalf("no replied line in %q", out)
+	}
+	for _, field := range []string{"queued=", "worked=", "after="} {
+		if !strings.Contains(line, field) {
+			t.Fatalf("reply line %q is missing %s", line, field)
+		}
+	}
+	// Both halves of the wait have to be real numbers, not placeholders.
+	if strings.Contains(line, "queued=0.0s") || strings.Contains(line, "worked=0.0s") {
+		t.Fatalf("reply line %q did not measure both the queue and the run", line)
+	}
+	if !strings.Contains(strings.Join(chat.allPosts(), "\n"), "not long") {
+		t.Fatalf("answer was not posted: %v", chat.allPosts())
+	}
+}
+
+// Time spent queued is other work finishing, not this turn running out of time. A message that waited
+// longer than MaxWait still has to get its answer, and must not be reported as a turn that timed out.
+func TestWatch_QueuedTurnGetsItsOwnWaitingBudget(t *testing.T) {
+	var logs bytes.Buffer
+	chat := &fakeChat{downloads: map[string][]byte{}}
+	gw := &fakeGateway{turns: map[string]gateway.Turn{}, state: gateway.State{Idle: true, Model: "rooter/test-model"}}
+	cfg := fastConfig()
+	cfg.PollInterval = 10 * time.Millisecond
+	cfg.MaxWait = 150 * time.Millisecond
+	b := New(chat, gw, cfg, slog.New(slog.NewTextHandler(&logs, nil)))
+
+	raw := withText(t, fixtureBytes(t, "dm_message.json"), "answer me late but answer me")
+	if err := b.Handle(context.Background(), "id-late", raw); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	id := gw.lastPrompt().ID
+
+	gw.setTurn(id, gateway.Turn{ID: id, Status: "queued"})
+	time.Sleep(250 * time.Millisecond) // longer than MaxWait, still inside the patience ceiling
+	gw.setTurn(id, gateway.Turn{ID: id, Status: "running", Turns: 1})
+	time.Sleep(100 * time.Millisecond)
+	gw.setTurn(id, gateway.Turn{ID: id, Status: "settled", Text: "here is the answer"})
+	b.Wait()
+
+	out := logs.String()
+	for _, wrong := range []string{"outlived the watching deadline", "stopped watching", "queued turn never started"} {
+		if strings.Contains(out, wrong) {
+			t.Fatalf("a queued turn was reported as %q: %q", wrong, out)
+		}
+	}
+	// While it waited, the bubble said what was actually happening rather than claiming work.
+	if !strings.Contains(out, "turn still queued") {
+		t.Fatalf("the queue wait was never reported to the user: %q", out)
+	}
+	if _, patched := chat.patchOf(chat.nameOf(b.cfg.Eyes)); !patched {
+		t.Fatalf("no queued notice was put on the bubble: posts=%v", chat.allPosts())
+	}
+	if !strings.Contains(strings.Join(chat.allPosts(), "\n"), "here is the answer") {
+		t.Fatalf("late answer was dropped: posts=%v logs=%q", chat.allPosts(), out)
+	}
+}
+
+func logLineWith(haystack, msg string) string {
+	for _, line := range strings.Split(haystack, "\n") {
+		if strings.Contains(line, "msg="+msg) {
+			return line
+		}
+	}
+	return ""
+}
+
 func isZeroValue(v reflect.Value) bool {
 	if !v.IsValid() {
 		return true
