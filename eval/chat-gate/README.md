@@ -47,11 +47,16 @@ Design decisions baked into the prompts:
 - summary is additive-merge with a hard 30-word cap; unchanged messages pass through.
 
 Bridge integration contract (for build-google-chat-bot):
-- **`initialed85/pi-bot` has never been registered in Woodpecker** (home-ops confirmed 2026-11-21 by reading
-  `woodpecker-postgres`: no row in `repos`, and zero pipelines for `5e16eb3`, `54426e0`, `5b75505` or `f13fc7f`).
-  So `.woodpecker/ci.yaml` and `.woodpecker/build.yaml` are inert for this repo, and every image so far has been
-  built and pushed by hand from the build lane. Nothing enforces the checks below automatically - run them.
-  Activating the repo needs a human Woodpecker login (same flow `mcbot` needed as repo id 35).
+- **`initialed85/pi-bot` IS registered in Woodpecker and CI does build it** (home-ops measured 2026-11-25:
+  Woodpecker in the `woodpecker` namespace on the home-dev context, `repo_id 36`, pipelines 1198-1218 all
+  `success`, one `killed` superseded push; today's builds `60f249e` -> `sha256:a73d34cd`, `ab28749` ->
+  `sha256:03e99f2e`, `b8fe57d` -> `sha256:39e6d8da…dae387`, also tagged `latest`).
+  An earlier version of this file asserted the opposite, based on reading `woodpecker-postgres` in the *prod*
+  cluster on 2026-11-21 (no `repos` row, zero pipelines for `5e16eb3`, `54426e0`, `5b75505`, `f13fc7f`).
+  That was the wrong server: pi-bot's pipelines run on home-dev's Woodpecker, not prod's. Do not re-derive CI
+  status from a memory of one query - `kubectl --context home-dev -n woodpecker` is where this repo's builds live.
+  What has NOT been verified is whether those pipelines run `go test ./...` / `go vet` for this repo, or only
+  build and push the image. Until someone reads a pipeline log, treat the checks below as things you run yourself.
 - The bridge embeds these prompts (`internal/chatgate/prompts/`, `go:embed`). **Prompt text is owned
   here.** Edit `prompts/*.md`, re-run the eval, then `node revendor.mjs` to copy them into the bridge.
   The authoritative equality check is `internal/chatgate/prompt_drift_test.go`: it fetches these files
