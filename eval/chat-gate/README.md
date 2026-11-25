@@ -61,6 +61,11 @@ Bridge integration contract (for build-google-chat-bot):
   woodpecker` before concluding anything about this repo's CI.
   Repo-scoped Woodpecker secrets for pi-bot are 0 rows, so the Hub credential the runner uses lives outside
   the per-repo secret store; nobody in the fleet needs it and nobody should go looking for it.
+- **Hub tags are the full 40-character commit sha, not the short sha.** `tags/ff1a6b0` 404s while
+  `tags/ff1a6b08d4f7...` resolves, and the digest is what home-ops pins anyway. A 404 on a short-sha tag
+  means "wrong tag name", not "the hook died" - check the pipeline (or `tags/latest`) before concluding
+  that a build is missing. Pipelines so far include `#1224 ba7a711 -> sha256:c47596e5...` and `#1228
+  ff1a6b0 -> sha256:a435a8b5...` (the build that fixed the room listener renewal).
   What has NOT been verified is whether those pipelines run `go test ./...` / `go vet` for this repo or only
   build and push. Until someone reads a pipeline log, treat the checks below as things you run yourself.
 - The bridge embeds these prompts (`internal/chatgate/prompts/`, `go:embed`). **Prompt text is owned
@@ -139,20 +144,28 @@ shipping to fall back on. Capture the window you care about *before* rolling (`k
 pi-bot-bridge-<old-pod> > /tmp/pre-roll.jsonl`), and keep such captures outside this repo:
 live transcripts are personal data and this repository is public.
 
-## What the gate can actually see in a group room (as of 2026-11-21)
+## What the gate can actually see in a group room (2026-11-21, superseded 2026-11-25)
 
-Two transport facts, both verified against the deployed credential, mean `should-respond`
+Two transport facts, both verified against the deployed *app* credential, mean `should-respond`
 currently has no way to run in a room at all:
 
 1. **Untagged room messages never reach the bridge.** Only DMs and @-mentions arrive as push
    events; a mention skips the gate by design, so it logs no decision. Zero group messages
    produced a gate line all day.
+   **Superseded 2026-11-25:** this is a property of the app credential, not of Chat. Untagged room
+   messages now arrive through a Workspace Events subscription authorised by Ed's own account
+   (`internal/bridge/workspace.go`, consumed since `ab28749`; the subscription renews itself in-process
+   and the renewed line is confirmed live). Loop-guard first, ownership second, dedupe third - mentions
+   and 1:1 DMs are deliberately left to the app path so the two transports cannot eat each other.
 2. **Thread ownership does not survive a restart.** The lookup added in `5e16eb3`
    (`HasBotMessage`) calls `spaces.messages.list`, and that read is permanently refused for
    this app - `chat.bot` gets a 403 and the wider `chat.app.messages.readonly` scopes return
    "requires administrator approval ... requires a Google Workspace organization". Ownership
    is therefore in-process only, and a roll makes pi-chat forget the threads it was tagged
    into, whose untagged follow-ups then get ignored without a model call.
+   **Still true for the app.** It is no longer true of the room: the human credential reads
+   `spaces.messages.list` with a 200, so rebuilding ownership from history is now possible rather than
+   impossible. It is not implemented; nothing should assume it exists.
 
 The one route that might unblock room traffic without a paid Workspace organization is
 *user* authorisation instead of the app credential - Google lists user auth as supported for
@@ -160,12 +173,16 @@ space event subscriptions, and every refusal so far came from the app credential
 `tools/chat-user-oauth-probe.mjs` (runs on a laptop, needs an OAuth client + one consent click).
 If it returns 200s where the app gets 403/500, room-wide listening becomes technically possible
 but means the bot reads the room as Ed, which is a disclosure decision before it is a feature.
+**This is no longer a proposal:** Ed authorised it, the subscription exists, the credential is a
+Kubernetes Secret mounted at 0400, and the disclosure decision was made with him in this repo's
+history. Read the room as Ed is what it is.
 
 Consequence for any review: **an empty decision table in enforce is the expected result, not
-evidence the gate is well-behaved.** "No suppressions" today means "the gate was never
-consulted", so group behaviour must be judged from offline eval (`eval.mjs`, `eval-real.mjs`)
-until ingress and ownership are fixed. Untagged DM follow-ups produce no line either - a DM is
-always answered and the `thread-request` gate fires only for unmentioned ones.
+evidence the gate is well-behaved.** It stays true, but the reason changed: the room path is now
+dry-run, so a quiet table means the room was genuinely quiet rather than deaf. Group behaviour is
+judged from three places now - offline eval (`eval.mjs`, `eval-real.mjs`), a room's real history
+(`tools/chat-space-history.mjs`), and live dry-run decisions. Untagged DM follow-ups produce no line
+either - a DM is always answered and the `thread-request` gate fires only for unmentioned ones.
 
 ## Reviewing the gate against a room's real history (2026-11-25)
 
