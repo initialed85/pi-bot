@@ -277,3 +277,19 @@ own chatter about pi-chat answerable as well, so it was rejected rather than tun
 ingestion correctness and for what Pi sees - pi-chat answering "still no non-mentions then i guess huh"
 on 2026-11-26 without ever being shown the 2026-11-23 thread root asking for a fortnightly pay schedule
 is the failure mode context removes.
+
+## 2026-11-26T06:09Z: room gating is in enforce
+
+`PI_CHAT_GATE_ROOM_ROOT=enforce`, on Ed's decision and on the evidence in `eval/chat-gate/README.md`,
+with the window at 20 messages / 2500 chars (his brief, not the 12/1500 default). Consequences of the
+mode, in the order they matter:
+
+- An untagged room message that `room-respond` answers YES to is forwarded to Pi and answered where Chat
+  put it - in its own thread normally, at the room root only if Chat did not give it one.
+- The mode is consulted at **two** sites in `groupMessageEligible`: new top-level messages, and threads
+  pi-chat has never spoken in. Both previously returned `false` under `ignore`, which is why the fix
+  mattered more than the flip.
+- Everything on the failure paths is unchanged and still fail-open: an unreadable window reaches the
+  classifier with no transcript, and a classifier error in enforce answers rather than going silent.
+- `dry-run` remains the rollback, and it is the mode to return to if a real room conversation gets an
+  answer it should not have. It is one value on one line.

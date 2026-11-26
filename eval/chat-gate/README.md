@@ -275,3 +275,19 @@ The window still ships, for three reasons the gate verdict is not one of them: i
 ownership* decision now reads (the 403 path is gone), it is what identity resolution reads, and it is
 what Pi receives on a mention - pi-chat answering "still no non-mentions" without ever being shown the
 2026-11-23 thread root it was being asked about is a worse failure than staying quiet.
+
+## Flipped to enforce (2026-11-26T06:09Z)
+
+Ed decided on the evidence above: "flip it mate, go large, go loud, let's crank this thingo into the
+most useful state and rip it adn grip it". `PI_CHAT_GATE_ROOM_ROOT=enforce`, with the window set to his
+brief (`PI_CHAT_GATE_CONTEXT_MESSAGES=20`, `PI_CHAT_GATE_CONTEXT_CHARS=2500`) rather than the 12/1500
+default, in home-ops `f9b5fdc` on image `f028fc10`.
+
+What that actually turns on is narrow, and it is worth restating because "enforce" sounds like a
+licence to chat: an untagged room message gets a reply only when `room-respond` answers YES. 44 real
+root messages were reviewed in dry-run and **none** was a YES, so this does not make the bot chattier
+about ordinary conversation. The traffic it unlocks is the direct-address shape - `cx-09`, YES 5/5 -
+which was previously thrown away by the 403 ownership read rather than suppressed by a verdict.
+
+Rollback is one value on one line: `dry-run`. The first enforce report is a scheduled check at 18:00
+AWST; a reply that should not have happened is a defect to name, not to tune around.
