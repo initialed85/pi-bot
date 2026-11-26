@@ -1350,6 +1350,9 @@ func (b *Bridge) watch(base context.Context, w *watch, start time.Time) {
 	failures := 0
 	started := false
 	queuedNotice := false
+	// Text we already delivered because the run ended, even though the turn has not settled. Once this
+	// is set the turn is answered in Chat: every later notice belongs in the log, not the thread.
+	posted := ""
 
 	for {
 		select {
@@ -1357,10 +1360,12 @@ func (b *Bridge) watch(base context.Context, w *watch, start time.Time) {
 			// The bridge is going away after its drain window ran out. Say so in the thread rather than
 			// leaving a bubble that says "working" forever - it is the last thing we can tell that user -
 			// but keep the turn owed, because the answer may still exist and the next process can deliver it.
-			b.setStatus(w, bubble, "⚠️ The bridge is restarting while that was running. I will post the answer when it lands, if I still have it."+idSuffix(w.turnID))
+			if posted == "" {
+				b.setStatus(w, bubble, "⚠️ The bridge is restarting while that was running. I will post the answer when it lands, if I still have it."+idSuffix(w.turnID))
+			}
 			return
 		case <-poll.Done():
-			if base.Err() == nil {
+			if base.Err() == nil && posted == "" {
 				if !started {
 					b.setStatus(w, bubble, fmt.Sprintf("⌛️ Pi has not started on that in %s - it is queued behind other work. Send it again, or send /stop to clear the queue.%s", humanDuration(b.cfg.MaxWait*queuePatience), idSuffix(w.turnID)))
 					b.log.Warn("queued turn never started", "turn", w.turnID, "waited", humanDuration(b.cfg.MaxWait*queuePatience))
@@ -1406,13 +1411,32 @@ func (b *Bridge) watch(base context.Context, w *watch, start time.Time) {
 		}
 
 		if turn.Settled() {
+			if posted != "" {
+				// We answered at the end of the run; Pi kept going (a compaction retry, or queued work rode
+				// this turn) and the final text differs. Say so visibly rather than quietly editing.
+				b.correctAnswer(w, posted, finalText(turn))
+				b.journal.drop(w.promptID)
+				return
+			}
 			b.finish(w, bubble, turn, time.Since(start))
 			return
 		}
 
+		if posted == "" && turn.Ended() {
+			posted = finalText(turn)
+			b.finish(w, bubble, turn, time.Since(start))
+			b.log.Info("answered at the end of the run; watching for the turn to settle", "turn", w.turnID,
+				"waited", humanDuration(time.Since(start)))
+			// Keep polling until it settles. Auto-compaction or queued work can change the final text, and
+			// the deadline below now ends quietly: the question is already answered in the thread.
+			continue
+		}
+
 		if started && time.Now().After(deadline) {
-			b.setStatus(w, bubble, fmt.Sprintf("⌛️ Still working, but I stopped watching after %s. Pi may still be running - send /status to check, or /stop to abort it.%s", b.cfg.MaxWait, idSuffix(w.turnID)))
-			b.log.Warn("turn outlived the watching deadline", "turn", w.turnID, "after", humanDuration(time.Since(start)), "queued", humanDuration(w.queued))
+			if posted == "" {
+				b.setStatus(w, bubble, fmt.Sprintf("⌛️ Still working, but I stopped watching after %s. Pi may still be running - send /status to check, or /stop to abort it.%s", b.cfg.MaxWait, idSuffix(w.turnID)))
+				b.log.Warn("turn outlived the watching deadline", "turn", w.turnID, "after", humanDuration(time.Since(start)), "queued", humanDuration(w.queued))
+			}
 			return
 		}
 		if !started && !queuedNotice && time.Since(start) > b.cfg.MaxWait {
@@ -1550,6 +1574,38 @@ func (b *Bridge) deliverAnswer(w *watch, bubble, text string) bool {
 		b.log.Debug("answer posted", "turn", w.turnID, "part", i+1, "of", len(chunks), "name", posted.Name, "chars", len(chunk))
 	}
 	return true
+}
+
+// correctAnswer posts what Pi finally settled on when the bridge already delivered an answer at the end
+// of the run and the text turned out to change underneath it - a compaction retry, or queued work that
+// rode the same turn. It is a new message rather than a silent edit, because a person who read the first
+// version is entitled to know there was a second one.
+func (b *Bridge) correctAnswer(w *watch, delivered, latest string) {
+	if strings.TrimSpace(latest) == strings.TrimSpace(delivered) {
+		return
+	}
+	b.log.Info("the answer changed after the run ended; posting the correction", "turn", w.turnID,
+		"delivered_chars", len(delivered), "settled_chars", len(latest))
+	b.noteRoomAnswer(w.space, latest)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	chunks := Chunk(latest, b.cfg.MaxChars)
+	for i, chunk := range chunks {
+		if i == 0 {
+			chunk = "✏️ *(corrected)* " + chunk
+		} else {
+			chunk = fmt.Sprintf("*(corrected, continued %d/%d)*", i+1, len(chunks)) + "\n\n" + chunk
+		}
+		if _, err := b.chat.Post(ctx, chunk, chatapi.PostOpts{
+			Space:    w.space,
+			Thread:   w.thread,
+			ClientID: clientID(fmt.Sprintf("correct-%s-%d", w.turnID, i)),
+		}); err != nil {
+			b.log.Error("correction post failed", "turn", w.turnID, "part", i+1, "err", err)
+			return
+		}
+	}
 }
 
 // Stop aborts whatever Pi is running. One Pi session per bridge, so this is deliberately global.

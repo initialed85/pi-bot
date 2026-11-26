@@ -84,6 +84,13 @@ interface Turn {
   turns: number;
   createdAt: number;
   startedAt?: number;
+  /**
+   * When the low-level run ended. Pi can still auto-compact, retry, or pick up queued work after this,
+   * so it is not the end of the turn - but the assistant's final message is written by then, and a chat
+   * bridge that waits for `agent_settled` makes a human watch "working" for minutes over an answer that
+   * already exists. The bridge delivers at this mark and corrects itself if the text later changes.
+   */
+  endedAt?: number;
   settledAt?: number;
   model?: string;
   error?: string;
@@ -347,6 +354,17 @@ export default function activate(pi: ExtensionAPI) {
   );
 
   off.push(
+    pi.on("agent_end", async (_event, ctx) => {
+      ctxRef = ctx;
+      // First end only: the bridge has already posted whatever this run's last message said, and a
+      // later change is handled as a correction, not a second timestamp.
+      if (!active || active.endedAt) return;
+      active.endedAt = Date.now();
+      pump();
+    }),
+  );
+
+  off.push(
     pi.on("agent_settled", async (event, ctx) => {
       ctxRef = ctx;
       const turn = active;
@@ -434,6 +452,7 @@ export default function activate(pi: ExtensionAPI) {
       inputs: turn.inputs.map((input) => ({ id: input.id, user: input.user, space: input.space, replyTo: input.replyTo, at: input.at, text: input.text })),
       createdAt: turn.createdAt,
       startedAt: turn.startedAt,
+      endedAt: turn.endedAt,
       settledAt: turn.settledAt,
       turns: turn.turns,
       model: turn.model,

@@ -335,3 +335,38 @@ PVC, and that is a home-ops storage decision rather than something I add on my o
 
 Every notice the bridge posts now carries `(id <turn-id>)`, because "what happened to that one?" should
 be a log lookup and not an archaeology exercise.
+
+## 2026-11-26T08:25Z: an answer is not the same thing as a settled turn
+
+Ed's observation, which is exactly right: *"the message was completely written, but then you spent
+minutes compacting, and it wasn't until compaction stopped that you sent it."*
+
+The gateway only marked a turn `settled` on pi's `agent_settled`, and pi documents that as the final
+signal precisely because a lot can happen between the last assistant message and it - auto-compaction,
+final-attempt overflow recovery, queued follow-up. For a TUI that is correct behaviour. For a chat bridge
+it is a human watching `👀` for minutes over an answer that already exists, because on this session
+compaction is expensive: the pi-bot context has been running all day and every turn ends by summarising
+tens of thousands of tokens before settling.
+
+So the bridge now treats two moments as two different things:
+
+- **`agent_end`** (gateway records `endedAt`) - the run is over and its final message is written. If there
+  is prose, deliver it. This is the answer shipping.
+- **`agent_settled`** - pi has stopped continuing. The watch keeps polling to here, and if the settled
+  text differs from what went out, it posts `✏️ *(corrected)* ...`.
+
+The correction is a new message rather than an edit: someone may already have read the first version, and
+a silently rewritten answer is how a bot loses trust. It is also why the watch does not stop at delivery -
+it has to know what pi finally said. An ended run with **no** prose (`AnswerRejected`, or an empty final
+message) is not delivered early, because that placeholder is a settling-time message and a retry may still
+produce the real answer.
+
+Both notices the bridge can post after the question is already answered are now suppressed - the drain
+notice and the `⌛️ still working` notice check `posted != ""` first. Once a person has their answer, the
+bridge has nothing useful left to say in that thread.
+
+Deployment note, so the split is not a surprise: this file ships in two halves. The bridge half activates
+with the pinned digest. The gateway half (`gateway/index.ts`, the `endedAt` mark) only runs inside the
+*pi session*, which loads pi-bot from `/root/.pi/agent/git/github.com/initialed85/pi-bot`, so it needs a
+package checkout update plus a Pi reload - and a reload drops the in-memory turn records, so it is done
+when the room is quiet, never mid-answer.

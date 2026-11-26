@@ -71,6 +71,7 @@ type Turn struct {
 	// tool-call markup. Gateways that predate that fix omit the field.
 	AnswerRejected string `json:"answerRejected"`
 	CreatedAt      int64  `json:"createdAt"`
+	EndedAt        int64  `json:"endedAt"`
 	SettledAt      int64  `json:"settledAt"`
 	Tools          []struct {
 		Name    string `json:"name"`
@@ -97,6 +98,14 @@ func (t *Turn) Settled() bool {
 		return true
 	}
 	return false
+}
+
+// Ended reports that Pi's low-level run is over and its final message is prose: the answer exists.
+// The turn is not settled yet - auto-compaction, a retry, or queued follow-up can still be running -
+// so an answer posted on this signal may need correcting. It should not be withheld: the settling
+// work has been measured at minutes, during which a Chat thread sits on a glyph over a written answer.
+func (t *Turn) Ended() bool {
+	return t.EndedAt > 0 && !t.Settled() && t.Text != ""
 }
 
 type State struct {
