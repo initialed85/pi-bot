@@ -45,7 +45,14 @@ const (
 	// carry an email (mentions and DMs on the app credential, whose captured payloads do contain
 	// "name":"users/<id>" alongside email and displayName), and nowhere else - chat.googleapis.com
 	// users.get answers 404 for this credential and spaces.members.list answers 403 insufficient scopes.
-	DefaultMask     = "message.name,message.text,message.sender,message.sender.name,message.sender.email,message.sender.displayName,message.sender.type,message.annotations,message.thread,message.space"
+	//
+	// The attachment fields were missing until 2026-11-26T23:2xZ, which is why an image posted in a room
+	// that does not tag the app arrived with no attachment data at all and was then dropped before the
+	// reply gate: the bridge treats a message with neither text nor attachments as nothing to do, in
+	// silence. Naming `message.attachment` and `message.attachmentDataRef` is necessary; whether it is
+	// sufficient is only answerable by an image that actually arrives, since (see above) a mask is proven
+	// by what shows up and not by what validateOnly accepts.
+	DefaultMask     = "message.name,message.text,message.sender,message.sender.name,message.sender.email,message.sender.displayName,message.sender.type,message.annotations,message.thread,message.space,message.attachment,message.attachmentDataRef"
 	DefaultInterval = 3 * time.Hour
 	tokenEndpoint   = "https://oauth2.googleapis.com/token"
 	// subscriptionsAPI is the API *base*, not the collection: create appends "/subscriptions" and

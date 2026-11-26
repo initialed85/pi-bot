@@ -188,7 +188,7 @@ type wireMessage struct {
 	Text         string          `json:"text"`
 	ArgumentText string          `json:"argumentText"`
 	Annotations  []wireAnnotation
-	Attachment   []wireAttachment
+	Attachment   []wireAttachment `json:"attachment"`
 	SlashCommand json.RawMessage `json:"slashCommand"`
 	Silent       bool            `json:"silent"`
 	CreateTime   string          `json:"createTime"`
