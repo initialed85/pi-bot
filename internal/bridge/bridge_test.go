@@ -275,6 +275,12 @@ func (g *fakeGateway) promptCount() int {
 	return len(g.prompts)
 }
 
+func (g *fakeGateway) promptList() []gateway.PromptRequest {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]gateway.PromptRequest(nil), g.prompts...)
+}
+
 func (g *fakeGateway) lastPrompt() gateway.PromptRequest {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -1145,6 +1151,9 @@ func TestFinalText_RejectsLeakedToolCallMarkup(t *testing.T) {
 
 type gateCall struct {
 	flow, summary, sender, message string
+	// transcript is what the conversation window rendered to; tests assert on it because "the gate saw
+	// the room" is the behaviour being added, and it is invisible in the answer.
+	transcript string
 }
 
 type fakeGate struct {
@@ -1176,14 +1185,14 @@ func (g *fakeGate) warmCounts() (int, int) {
 	return g.warms, g.keepWarms
 }
 
-func (g *fakeGate) Classify(_ context.Context, flow, summary, sender, message string) (string, string, time.Duration, error) {
+func (g *fakeGate) Classify(_ context.Context, req chatgate.Request) (string, string, time.Duration, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.calls = append(g.calls, gateCall{flow: flow, summary: summary, sender: sender, message: message})
-	if err := g.errs[flow]; err != nil {
+	g.calls = append(g.calls, gateCall{flow: req.Flow, summary: req.Summary, sender: req.Sender, message: req.Message, transcript: req.Transcript})
+	if err := g.errs[req.Flow]; err != nil {
 		return "", "", 0, err
 	}
-	return g.answers[flow], "prompt:" + flow, 0, nil
+	return g.answers[req.Flow], "prompt:" + req.Flow, 0, nil
 }
 
 func (g *fakeGate) callsFor(flow string) []gateCall {
@@ -1574,6 +1583,9 @@ func TestWithDefaultsCarriesEveryConfigField(t *testing.T) {
 		ReplyGateTimeout:      3 * time.Second,
 		ReplyGateAttempts:     []time.Duration{3 * time.Second},
 		GateKeepAlive:         30 * time.Millisecond,
+		Conversation:          &fakeConversation{transcript: "[00:01] Owner: hello"},
+		GateContextMessages:   7,
+		GateContextChars:      800,
 	}
 
 	out := in.withDefaults()
@@ -1745,5 +1757,192 @@ func isZeroValue(v reflect.Value) bool {
 		return v.Len() == 0
 	default:
 		return v.IsZero()
+	}
+}
+
+// fakeConversation is the window the bridge reads: the transcript, the people in it, and the failure
+// that used to be the interesting case. It records what it was asked for because "one Chat read per
+// message" is a property the pipeline depends on and cannot be seen in any other output.
+type fakeConversation struct {
+	mu         sync.Mutex
+	asks       []string
+	people     []Person
+	transcript string
+	err        error
+}
+
+func (c *fakeConversation) Context(_ context.Context, space, thread string) (RoomContext, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.asks = append(c.asks, space+"|"+thread)
+	if c.err != nil {
+		return RoomContext{}, c.err
+	}
+	return RoomContext{Transcript: c.transcript, People: c.people}, nil
+}
+
+func (c *fakeConversation) askList() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.asks...)
+}
+
+func botPerson() Person {
+	return Person{ID: "users/111", DisplayName: "pi-chat", Bot: true}
+}
+
+func humanPerson(id, email string) Person {
+	return Person{ID: id, Email: email, DisplayName: "Owner"}
+}
+
+// The ownership question used to be answered by an app-credential read that answers
+// 403 ACCESS_TOKEN_SCOPE_INSUFFICIENT in production; groupMessageEligible then returned false and the
+// message disappeared without a model call. The window answers it instead, and a thread pi-chat has
+// spoken in stays a continuation.
+func TestConversation_OwnershipComesFromTheWindow(t *testing.T) {
+	conv := &fakeConversation{
+		people:     []Person{botPerson(), humanPerson("users/222", "owner@example.com")},
+		transcript: "[03:25] Owner: so what's the scoop mr. bot, are you working today or not?",
+	}
+	gate := &fakeGate{answers: map[string]string{chatgate.FlowShouldRespond: "YES"}, errs: map[string]error{}}
+	// ownedThreads is empty on purpose: the app fake says "not ours", so any pass here came from the window.
+	b := New(&fakeChat{ownedThreads: map[string]bool{}}, &fakeGateway{}, Config{
+		ReplyGateMode: "enforce", GateRoomRootMode: "enforce", ReplyGate: gate, Conversation: conv,
+		Allowlist: []string{"owner@example.com"}, RequireMentionInRooms: false,
+	}, nil)
+
+	ev := gateEvent(false, false)
+	if !b.groupMessageEligible(context.Background(), ev) {
+		t.Fatal("a thread the window shows pi-chat posted in was not eligible")
+	}
+	if _, suppress := b.replyGate(context.Background(), ev, ev.Prompt()); suppress {
+		t.Fatal("a continuation the classifier said YES to was suppressed")
+	}
+	calls := gate.callsFor(chatgate.FlowShouldRespond)
+	if len(calls) != 1 {
+		t.Fatalf("a thread pi-chat speaks in should be judged as a continuation, calls=%v", gate.calls)
+	}
+	if calls[0].transcript == "" {
+		t.Fatal("the classifier decided on a bare line with no conversation")
+	}
+	// One read per message, shared by eligibility and the gate: the Chat API is slower than the model.
+	if asks := conv.askList(); len(asks) != 1 {
+		t.Fatalf("the window was read %d times for one message: %v", len(asks), asks)
+	}
+}
+
+// A thread pi-chat has never spoken in is an intrusion decision, and the room prompt is the one that
+// weighs "would answering be barging in". It must be judged, not silently ignored - which is what the
+// old code did before the message ever reached a model.
+func TestConversation_ForeignThreadIsJudgedForIntrusion(t *testing.T) {
+	conv := &fakeConversation{people: []Person{humanPerson("users/222", "owner@example.com")}, transcript: "[00:54] A: yeah\n[00:56] B: same here"}
+	gate := &fakeGate{answers: map[string]string{chatgate.FlowRoomRespond: "NO"}, errs: map[string]error{}}
+	b := New(&fakeChat{}, &fakeGateway{}, Config{
+		ReplyGateMode: "enforce", GateRoomRootMode: "enforce", ReplyGate: gate, Conversation: conv,
+		Allowlist: []string{"owner@example.com"}, RequireMentionInRooms: false,
+	}, nil)
+	ev := gateEvent(false, false)
+	if !b.groupMessageEligible(context.Background(), ev) {
+		t.Fatal("an untagged message in a stranger's thread was dropped before the classifier")
+	}
+	if _, suppress := b.replyGate(context.Background(), ev, ev.Prompt()); !suppress {
+		t.Fatal("the room classifier said NO and the bridge answered anyway")
+	}
+	if len(gate.callsFor(chatgate.FlowRoomRespond)) != 1 || len(gate.callsFor(chatgate.FlowShouldRespond)) != 0 {
+		t.Fatalf("wrong prompt used for a thread pi-chat is not part of: %v", gate.calls)
+	}
+}
+
+// The failure mode being retired is a lookup error that silently deletes a message. A window Google will
+// not open must degrade to today's behaviour - judge the line, log that context is missing - never to a
+// drop.
+func TestConversation_UnreadableWindowStillReachesTheClassifier(t *testing.T) {
+	conv := &fakeConversation{err: fmt.Errorf("chatevents: history: http 403: ACCESS_TOKEN_SCOPE_INSUFFICIENT")}
+	gate := &fakeGate{answers: map[string]string{chatgate.FlowShouldRespond: "YES"}, errs: map[string]error{}}
+	b := New(&fakeChat{ownedThreads: map[string]bool{}}, &fakeGateway{}, Config{
+		ReplyGateMode: "enforce", GateRoomRootMode: "enforce", ReplyGate: gate, Conversation: conv,
+		Allowlist: []string{"owner@example.com"}, RequireMentionInRooms: false,
+	}, nil)
+	ev := gateEvent(false, false)
+	if !b.groupMessageEligible(context.Background(), ev) {
+		t.Fatal("a failed context read dropped the message")
+	}
+	if _, suppress := b.replyGate(context.Background(), ev, ev.Prompt()); suppress {
+		t.Fatal("a failed context read suppressed a message the classifier never got to judge")
+	}
+	if len(gate.callsFor(chatgate.FlowShouldRespond)) != 1 {
+		t.Fatalf("a message with no window should keep the continuation prompt it always had: %v", gate.calls)
+	}
+}
+
+// The room listener ships {"name":"users/<id>","type":"HUMAN"} and no email; messages.list in the same
+// space ships that same id with an email. Resolving from the window means a person who has never tagged
+// the app can be identified without a second read.
+func TestRoomIdentityResolvedFromTheConversationWindow(t *testing.T) {
+	conv := &fakeConversation{people: []Person{humanPerson("users/999", "owner@example.com")}}
+	b := New(&fakeChat{}, &fakeGateway{}, Config{Conversation: conv, Allowlist: []string{"owner@example.com"}}, nil)
+	ev := gateEvent(false, false)
+	ev.UserEmail = ""
+	ev.UserID = "users/999"
+
+	key, source, ok := b.resolveRoomIdentity(context.Background(), ev)
+	if !ok || key != "users/999" || source != identityFromConversation {
+		t.Fatalf("identity not resolved from the window: key=%q source=%q ok=%v", key, source, ok)
+	}
+	if ev.UserEmail != "owner@example.com" {
+		t.Fatalf("email not filled in: %q", ev.UserEmail)
+	}
+	if !b.allowed(ev) {
+		t.Fatal("an identity resolved from the window does not satisfy the allowlist")
+	}
+	// Learning it once must not cost another read the next time the same person speaks: the bridge keeps
+	// the binding, and a fresh event from the same id resolves without asking Google again.
+	before := len(conv.askList())
+	again := gateEvent(false, false)
+	again.UserEmail = ""
+	again.UserID = "users/999"
+	key2, source2, ok2 := b.resolveRoomIdentity(context.Background(), again)
+	if !ok2 || key2 != "users/999" || source2 == identityFromConversation {
+		t.Fatalf("second sighting did not use the remembered binding: key=%q source=%q ok=%v", key2, source2, ok2)
+	}
+	if again.UserEmail != "owner@example.com" {
+		t.Fatalf("remembered email not applied: %q", again.UserEmail)
+	}
+	if len(conv.askList()) != before {
+		t.Fatalf("the window was re-read for a person already identified: %v", conv.askList())
+	}
+}
+
+// Ed's requirement, stated plainly: being @'d into the middle of a thread is the case where the thing
+// being asked about is not in the message. pi-chat's own reply at 04:04 on 2026-11-26 was to
+// "still no non-mentions then i guess huh?", in a thread whose root - a fortnightly pay schedule request
+// from 2026-11-23 - Pi had never been shown.
+func TestMentionPromptCarriesTheConversationWindow(t *testing.T) {
+	chat := &fakeChat{}
+	gw := &fakeGateway{turns: map[string]gateway.Turn{}}
+	window := "[07:14] Owner: @pi-chat can you give me a fortnightly schedule in terms of when i get paid\n…" +
+		"\n[04:04] Owner: @pi-chat still no non-mentions then i guess huh?"
+	conv := &fakeConversation{people: []Person{botPerson(), humanPerson("users/222", "owner@example.com")}, transcript: window}
+	b := New(chat, gw, Config{
+		Conversation: conv, Allowlist: []string{"owner@example.com"},
+		ReplyGateMode: "enforce", GateRoomRootMode: "enforce",
+		ReplyGate: &fakeGate{answers: map[string]string{}, errs: map[string]error{}},
+		MaxWait:   20 * time.Millisecond, PollInterval: time.Millisecond,
+	}, nil)
+
+	ev := gateEvent(false, true)
+	if err := b.onMessage(context.Background(), ev); err != nil {
+		t.Fatalf("onMessage: %v", err)
+	}
+	b.Wait()
+	prompts := gw.promptList()
+	if len(prompts) != 1 {
+		t.Fatalf("prompts=%d, want the mention to reach Pi exactly once", len(prompts))
+	}
+	if !strings.Contains(prompts[0].Text, "fortnightly schedule") {
+		t.Fatalf("the thread root never reached the run: %q", prompts[0].Text)
+	}
+	if !strings.Contains(prompts[0].Text, "still no non-mentions") {
+		t.Fatalf("the message itself is missing from the prompt: %q", prompts[0].Text)
 	}
 }

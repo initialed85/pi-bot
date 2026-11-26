@@ -141,7 +141,8 @@ type History struct {
 
 	tokenURL string
 	mu       sync.Mutex
-	cached   map[string]Context
+	windows  map[string]windowEntry
+	roots    map[string]rootEntry
 	calls    int
 }
 
@@ -158,8 +159,23 @@ func NewHistory(cred Credential, log *slog.Logger) *History {
 		MaxAge:       historyMaxAge,
 		MaxChar:      4000,
 		tokenURL:     "",
-		cached:       map[string]Context{},
+		windows:      map[string]windowEntry{},
+		roots:        map[string]rootEntry{},
 	}
+}
+
+// windowEntry is a cached space window; readAt drives the TTL.
+type windowEntry struct {
+	messages []Message
+	readAt   time.Time
+}
+
+// rootEntry is a cached thread root. found=false is cached too: a thread whose root was deleted, or is
+// simply not addressable, would otherwise cost a failed GET on every message in it.
+type rootEntry struct {
+	message Message
+	found   bool
+	readAt  time.Time
 }
 
 // WithTokenURL points the OAuth exchange somewhere else. Tests only.
@@ -180,39 +196,89 @@ func (h *History) Calls() int {
 // Narrowing happens client-side because the API refuses to filter by thread (400, measured). A thread
 // that is older than the window still gets its root, fetched by name, so the classifier is never
 // reading a reply with nothing to reply to.
+//
+// The space window is cached per space rather than per space+thread, because one arriving message needs
+// it twice: once to find out who sent it, since a room event ships a bare users/<id> with no email, and
+// once to build the transcript. Two reads of the same twenty messages would make the context the slowest
+// part of a decision that has three seconds to spend - one window read measured 1.6s against the real
+// API on 2026-11-26.
 func (h *History) Context(ctx context.Context, space, thread string) (Context, error) {
 	if space == "" {
 		return Context{}, fmt.Errorf("chatevents: history needs a space")
 	}
-	key := space + "|" + thread
-	if c, ok := h.getCached(key); ok {
-		return c, nil
-	}
-
-	window, err := h.read(ctx, space, "")
+	window, err := h.window(ctx, space)
 	if err != nil {
 		return Context{}, err
 	}
-	c := Context{ReadAt: time.Now().UTC()}
-	if thread != "" {
-		for _, m := range window {
-			if m.Thread == thread {
-				c.Messages = append(c.Messages, m)
-			}
-		}
-		// The thread may be entirely outside the window. Its root is still the context that matters,
-		// and an empty transcript is honest about a quiet thread; a stale one is not.
-		if root, ok, err := h.rootOf(ctx, space, thread); err == nil && ok {
-			c.Root = &root
-			if len(c.Messages) == 0 {
-				c.Messages = []Message{root}
-			}
-		}
-	} else {
-		c.Messages = window
+	c := Context{ReadAt: window.readAt}
+	if thread == "" {
+		c.Messages = window.messages
+		return c, nil
 	}
-	h.putCached(key, c)
+	for _, m := range window.messages {
+		if m.Thread == thread {
+			c.Messages = append(c.Messages, m)
+		}
+	}
+	// The thread may be entirely outside the window. Its root is still the context that matters, and an
+	// empty transcript is honest about a quiet thread; a stale one is not.
+	if root, ok := h.root(ctx, space, thread); ok {
+		c.Root = &root
+		if len(c.Messages) == 0 {
+			c.Messages = []Message{root}
+		}
+	}
 	return c, nil
+}
+
+// window returns the cached recent messages of a space, reading Google only when the cache is cold.
+func (h *History) window(ctx context.Context, space string) (windowEntry, error) {
+	h.mu.Lock()
+	if e, ok := h.windows[space]; ok && time.Since(e.readAt) <= historyCacheOK {
+		h.mu.Unlock()
+		return e, nil
+	}
+	h.mu.Unlock()
+
+	messages, err := h.read(ctx, space, "")
+	if err != nil {
+		return windowEntry{}, err
+	}
+	e := windowEntry{messages: messages, readAt: time.Now().UTC()}
+	h.mu.Lock()
+	if len(h.windows) > 64 {
+		h.windows = map[string]windowEntry{}
+	}
+	h.windows[space] = e
+	h.mu.Unlock()
+	return e, nil
+}
+
+// root fetches, or remembers, the message that opened a thread. A thread whose root cannot be read is
+// remembered as not found, so a deleted root does not cost a failed GET on every message in the thread.
+func (h *History) root(ctx context.Context, space, thread string) (Message, bool) {
+	key := space + "|" + thread
+	h.mu.Lock()
+	if e, ok := h.roots[key]; ok && time.Since(e.readAt) <= historyCacheOK {
+		h.mu.Unlock()
+		return e.message, e.found
+	}
+	h.mu.Unlock()
+
+	message, found, err := h.rootOf(ctx, space, thread)
+	if err != nil {
+		// Losing a root read is not worth losing the window over, but it is not remembered either: the
+		// next message in the thread should get the chance to find it.
+		h.log.Debug("thread root read failed", "thread", thread, "err", err)
+		return Message{}, false
+	}
+	h.mu.Lock()
+	if len(h.roots) > 256 {
+		h.roots = map[string]rootEntry{}
+	}
+	h.roots[key] = rootEntry{message: message, found: found, readAt: time.Now().UTC()}
+	h.mu.Unlock()
+	return message, found
 }
 
 // HasBotMessage answers, from the same window, whether pi-chat already speaks in this thread. It
@@ -379,16 +445,6 @@ func (h *History) tokenURLOrDefault() string {
 	return tokenEndpoint
 }
 
-func (h *History) getCached(key string) (Context, bool) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	c, ok := h.cached[key]
-	if !ok || time.Since(c.ReadAt) > historyCacheOK {
-		return Context{}, false
-	}
-	return c, true
-}
-
 // rawMessage is the wire shape. Text is decoded tolerantly because the REST layer has answered both
 // `"text": "…"` and the structured `{"textSegments":[…]}` form depending on the fields requested, and
 // a decoder that picks one loses the other silently.
@@ -437,13 +493,4 @@ func (r rawMessage) parse() Message {
 		}
 	}
 	return m
-}
-
-func (h *History) putCached(key string, c Context) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if len(h.cached) > 64 {
-		h.cached = map[string]Context{}
-	}
-	h.cached[key] = c
 }

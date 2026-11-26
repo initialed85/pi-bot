@@ -82,6 +82,22 @@ type Event struct {
 	Command     string
 	CommandArgs string
 
+	// The three fields below are filled in by the bridge after parsing, from a read of the space, and are
+	// never parsed off a payload. They exist because the classifier's judgement is only as good as the
+	// conversation it can see: "so what's the scoop mr. bot, are you working today or not?" is a question
+	// to pi-chat in a thread pi-chat opened, and a sentence in the middle of nobody's conversation
+	// otherwise.
+	//
+	// Conversation is the surrounding messages, oldest first, in [time] who: what form. Empty on its own
+	// is ambiguous, so ContextRead says whether a window was ever obtained.
+	Conversation string
+	ContextRead  bool
+	// ThreadHasBot says pi-chat has already posted in this thread within the window that was read. It
+	// selects which judgement applies - continuing a conversation pi-chat joined, or deciding whether to
+	// intrude on one it has not - and it comes from the window rather than from an app-credential read
+	// because that read 403s.
+	ThreadHasBot bool
+
 	// Source records which path delivered this event: "app" for the Chat app's own credential (only
 	// messages that tag the app, plus everything in a 1:1 with it) or "workspace" for the
 	// user-authorised room listener (everything the authorising human can see). Routing depends on it.

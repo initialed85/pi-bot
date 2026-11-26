@@ -134,6 +134,12 @@ func run() error {
 		} else {
 			roomCred, haveRoomCred = cred, true
 			s.cfg.Identity = identityLookup{lookup: chatevents.NewSenderLookup(cred, logger.With("component", "room-identity"))}
+			history := chatevents.NewHistory(cred, logger.With("component", "room-history"))
+			s.cfg.Conversation = conversationReader{
+				history:  history,
+				messages: s.cfg.GateContextMessages,
+				chars:    s.cfg.GateContextChars,
+			}
 		}
 	}
 	s.cfg.IdentitySeed = s.identitySeed
@@ -235,6 +241,49 @@ func run() error {
 // imports the subscription package or a Google client just to ask who a user id belongs to.
 type identityLookup struct {
 	lookup *chatevents.SenderLookup
+}
+
+// conversationReader adapts the OAuth-backed history reader to the bridge's context type, for the same
+// reason identityLookup exists: the bridge asks what was said without importing a credential package.
+//
+// The transcript bounds come from config and are applied here because rendering the window is the
+// reader's job while deciding how much of it a small model should be shown is the bridge's.
+type conversationReader struct {
+	history  *chatevents.History
+	messages int
+	chars    int
+}
+
+func (c conversationReader) Context(ctx context.Context, space, thread string) (bridge.RoomContext, error) {
+	window, err := c.history.Context(ctx, space, thread)
+	if err != nil {
+		return bridge.RoomContext{}, err
+	}
+	limit, budget := c.messages, c.chars
+	if limit <= 0 {
+		limit = bridge.DefaultConfig().GateContextMessages
+	}
+	if budget <= 0 {
+		budget = bridge.DefaultConfig().GateContextChars
+	}
+	out := bridge.RoomContext{Transcript: window.Transcript(limit, budget)}
+	seen := map[string]bool{}
+	add := func(m chatevents.Message) {
+		if m.Sender == "" || seen[m.Sender] {
+			return
+		}
+		seen[m.Sender] = true
+		out.People = append(out.People, bridge.Person{ID: m.Sender, Email: m.Email, DisplayName: m.DisplayName, Bot: m.Bot})
+	}
+	for _, m := range window.Messages {
+		add(m)
+	}
+	// The root is a person the window may not contain, and it settles the ownership question in the case
+	// that matters most: a thread pi-chat itself opened, whose replies have since scrolled out of view.
+	if window.Root != nil {
+		add(*window.Root)
+	}
+	return out, nil
 }
 
 func (i identityLookup) Resolve(ctx context.Context, space, userID string) (bridge.SenderIdentity, bool, error) {

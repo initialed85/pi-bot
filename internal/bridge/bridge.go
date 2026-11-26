@@ -52,6 +52,33 @@ type Gateway interface {
 	Commands(ctx context.Context) ([]gateway.Command, error)
 }
 
+// Person is one sender the conversation window mentioned, in the shape the bridge needs: enough to match
+// a room event's bare users/<id> to an email, and enough to tell whether pi-chat itself has posted.
+type Person struct {
+	ID          string
+	Email       string
+	DisplayName string
+	Bot         bool
+}
+
+// RoomContext is what surrounds a message: a rendered transcript and the people in it.
+type RoomContext struct {
+	Transcript string
+	People     []Person
+}
+
+// Conversation reads the messages around one event. It is the same object that answers "who sent this"
+// and "has pi-chat spoken in this thread", because all three come from one window of one space and the
+// Chat API is the slowest thing in the pipeline - reading it three times per message is slower than the
+// classifier call the message is waiting on.
+//
+// The result types are local, like SenderIdentity next to IdentityResolver, so the bridge can be tested
+// without a Chat credential and does not import the subscription package or a Google client to ask what
+// was said.
+type Conversation interface {
+	Context(ctx context.Context, space, thread string) (RoomContext, error)
+}
+
 // SenderIdentity is what Chat published about a user id: the email the allowlist is written in, and the
 // name to put on a prompt so a shared session knows whose request it is honouring.
 type SenderIdentity struct {
@@ -147,6 +174,17 @@ type Config struct {
 	// email (a mention or a 1:1) since this process started, which makes a freshly rolled pod deaf until
 	// somebody tags it.
 	Identity IdentityResolver
+	// Conversation reads the window of messages a room message landed in, under the human credential that
+	// already authorises the room listener. It replaces two things that were each worse: an
+	// app-credential thread-ownership read that answers 403 and whose failure dropped messages unseen, and
+	// a classifier judging a single bare line. Nil keeps the pre-context behaviour.
+	Conversation Conversation
+	// GateContextMessages and GateContextChars bound what the classifier is shown. They are bounded
+	// because the decision is made by a small model on a warm-but-not-free endpoint: an unbounded
+	// transcript is how a 300ms judgement turns into a timeout, and the oldest lines of a 200-message
+	// room are the least relevant thing in it.
+	GateContextMessages int
+	GateContextChars    int
 	// IdentitySeed binds known user ids to emails at startup so identity survives a redeploy. Format is
 	// "users/<id>=email" or "<legacyId>=email", comma separated (see ParseIdentitySeed). Not a secret:
 	// a Chat user id is not a credential, and the email on the other side is already in the allowlist.
@@ -176,6 +214,8 @@ func DefaultConfig() Config {
 		ReplyGateMode:         "off",
 		ReplyGateTimeout:      3 * time.Second,
 		GateKeepAlive:         5 * time.Minute,
+		GateContextMessages:   12,
+		GateContextChars:      1500,
 	}
 }
 
@@ -243,6 +283,15 @@ func (c Config) withDefaults() Config {
 	// way and the room lookup looked like a no-op that did nothing. TestWithDefaultsCarriesEveryConfigField
 	// now catches the class rather than the instance.
 	d.Identity = c.Identity
+	d.Conversation = c.Conversation
+	d.GateContextMessages = c.GateContextMessages
+	if d.GateContextMessages <= 0 {
+		d.GateContextMessages = DefaultConfig().GateContextMessages
+	}
+	d.GateContextChars = c.GateContextChars
+	if d.GateContextChars <= 0 {
+		d.GateContextChars = DefaultConfig().GateContextChars
+	}
 	d.IdentitySeed = c.IdentitySeed
 	// A bool has no sentinel to test against, so it is copied rather than defaulted: leaving it out
 	// silently drops the operator's setting.
@@ -293,6 +342,7 @@ type Bridge struct {
 	// and on the room listener with only an id, so the tagged message teaches the bridge who the id is.
 	// Room answers therefore depend on a person having tagged the app at least once since the last roll.
 	people    map[string]string
+	conv      Conversation
 	gate      chatgate.Classifier
 	lastSpace string
 	watchers  sync.WaitGroup
@@ -351,6 +401,7 @@ func New(chat Chat, gw Gateway, cfg Config, log *slog.Logger) *Bridge {
 		roomAnswers: map[string]string{},
 		piThreads:   map[string]struct{}{},
 		gate:        gate,
+		conv:        resolved.Conversation,
 	}
 	// Identity bindings are the one piece of state a redeploy otherwise loses, and the room path needs
 	// them from the very first message. Seeding them from config is what makes a cold pod able to answer
@@ -550,6 +601,7 @@ func (b *Bridge) resolveIdentity(ev *chatmsg.Event) (string, bool) {
 const (
 	identityFromTaggedMessage = "tagged-message"
 	identityFromSpaceHistory  = "space-message-history"
+	identityFromConversation  = "conversation-window"
 	identityFromSeed          = "seed"
 )
 
@@ -572,6 +624,16 @@ func (b *Bridge) resolveRoomIdentity(ctx context.Context, ev *chatmsg.Event) (st
 	}
 
 	resolver := b.cfg.Identity
+	// The conversation window answers "who is users/<id>" from the same read that answers "what was said
+	// around this message", and it is the only source that works for a person who has never tagged the app.
+	// It goes before the dedicated lookup because the lookup would be a second read of the same space.
+	if b.conv != nil {
+		if email, key, ok := b.identityFromWindow(ctx, ev); ok {
+			ev.UserEmail = email
+			b.bindIdentity(ev)
+			return key, identityFromConversation, true
+		}
+	}
 	if resolver == nil {
 		return "", "", false
 	}
@@ -715,7 +777,23 @@ func (b *Bridge) onMessage(ctx context.Context, ev *chatmsg.Event) error {
 		return b.onCommand(ctx, ev)
 	}
 
+	// Read once, here, so the classifier and Pi see the same conversation and the Chat API is asked once.
+	// A mention needs it as much as an untagged message does - arguably more, since being @'d into the
+	// middle of a thread is the case where the thing being asked about is not in the message.
+	if b.conv != nil && !ev.DM {
+		if err := b.readContext(ctx, ev); err != nil {
+			b.log.Warn("no conversation window for this message", "space", ev.Space, "thread", ev.Thread, "err", err)
+		}
+	}
 	prompt := ev.Prompt()
+	// Pi gets the same window the classifier judged on. A mention that lands three messages into a
+	// thread pi-chat has not seen is otherwise a question about a request the bridge has never read: the
+	// root of spaces/qi7VbgAAAAE/threads/3fbZOFDt3zI is from 2026-11-23 and asks for a fortnightly pay
+	// schedule, and the message that woke pi-chat on 2026-11-26 was "still no non-mentions then i guess".
+	if ev.Conversation != "" && !ev.DM {
+		prompt = "Conversation in this room so far, oldest first, read from Google Chat just now. " +
+			"The new message to act on is quoted after it.\n" + ev.Conversation + "\nNew message: " + prompt
+	}
 	replyThread, suppress := b.replyGate(ctx, ev, prompt)
 	if suppress {
 		return nil
@@ -766,7 +844,11 @@ func (b *Bridge) replyGate(ctx context.Context, ev *chatmsg.Event, message strin
 	flow := chatgate.FlowShouldRespond
 	if ev.DM {
 		flow = chatgate.FlowThreadRequest
-	} else if isTopLevel(ev) {
+	} else if isTopLevel(ev) || (b.conv != nil && ev.ContextRead && !ev.ThreadHasBot) {
+		// Either a new room message, or one inside a thread the window shows pi-chat has never spoken in.
+		// The second case is an intrusion question, not a continuation one, and should-respond's prompt
+		// assumes the bot is already a party to the thread - asking it anyway is how a bot barges into two
+		// people arguing.
 		flow = chatgate.FlowRoomRespond
 	}
 	// The room flow answers to its own switch, so trialling a room in dry-run cannot turn the flows
@@ -778,6 +860,13 @@ func (b *Bridge) replyGate(ctx context.Context, ev *chatmsg.Event, message strin
 	if b.gate == nil || mode == "off" || mode == "ignore" || ev.Mentioned {
 		return replyThread, false
 	}
+	// The window is read here rather than earlier so a message that is never going to be classified - a
+	// mention, or a room with gating switched off - costs no Chat read at all.
+	if b.conv != nil && !ev.DM {
+		if err := b.readContext(ctx, ev); err != nil {
+			b.log.Warn("classifying without conversation context", "space", ev.Space, "thread", ev.Thread, "err", err)
+		}
+	}
 	started := time.Now()
 	summary := b.summaryFor(ev.Thread)
 	if flow == chatgate.FlowRoomRespond {
@@ -788,14 +877,14 @@ func (b *Bridge) replyGate(ctx context.Context, ev *chatmsg.Event, message strin
 		// The running summary is enrichment, not a decision. It gets its own short deadline so a
 		// slow summary cannot eat the budget the actual respond/ignore call needs.
 		summaryCtx, cancelSummary := context.WithTimeout(ctx, 4*time.Second)
-		answer, _, _, err := b.gate.Classify(summaryCtx, chatgate.FlowSummary, summary, ev.Who(), message)
+		answer, _, _, err := b.gate.Classify(summaryCtx, chatgate.Request{Flow: chatgate.FlowSummary, Summary: summary, Sender: ev.Who(), Message: message, Transcript: ev.Conversation})
 		cancelSummary()
 		if err == nil {
 			summary = summaryWords(answer)
 			b.setSummary(ev.Thread, summary)
 		}
 	}
-	answer, prompt, _, err := b.gate.Classify(ctx, flow, summary, ev.Who(), message)
+	answer, prompt, _, err := b.gate.Classify(ctx, chatgate.Request{Flow: flow, Summary: summary, Sender: ev.Who(), Message: message, Transcript: ev.Conversation})
 	if err == nil && flow != chatgate.FlowSummary {
 		if _, ok := exactGateToken(answer, flow); !ok {
 			err = fmt.Errorf("invalid %s classifier answer %q", flow, answer)
@@ -829,7 +918,7 @@ func (b *Bridge) replyGate(ctx context.Context, ev *chatmsg.Event, message strin
 	}
 	// user and space are on this line because reviewing a dry-run means answering "who would the bot have
 	// replied to, and where", and a room judgement with no author is not reviewable - it is a count.
-	b.log.Info("reply gate", "thread", ev.Thread, "space", ev.Space, "user", ev.UserEmail, "flow", flow, "prompt", prompt, "answer", answer, "latency_ms", time.Since(started).Milliseconds(), "action", loggedAction)
+	b.log.Info("reply gate", "thread", ev.Thread, "space", ev.Space, "user", ev.UserEmail, "flow", flow, "context_chars", len(ev.Conversation), "thread_has_bot", ev.ThreadHasBot, "prompt", prompt, "answer", answer, "latency_ms", time.Since(started).Milliseconds(), "action", loggedAction)
 	if flow == chatgate.FlowRoomRespond && mode != "enforce" {
 		// Dry-run measures the room classifier without putting new text in a shared room: a would-be
 		// room answer is logged and dropped, so reviewing the feature cannot itself be the noise.
@@ -873,6 +962,24 @@ func (b *Bridge) groupMessageEligible(ctx context.Context, ev *chatmsg.Event) bo
 	if b.isPiThread(ev.Thread) {
 		return true
 	}
+	if b.conv != nil {
+		// The window answers the ownership question the app credential cannot: its senders carry
+		// pi-chat's own posts, and reading it costs one call that is also feeding the classifier.
+		if err := b.readContext(ctx, ev); err != nil {
+			b.log.Warn("no conversation window; the message goes to the classifier rather than being dropped unseen",
+				"space", ev.Space, "thread", ev.Thread, "err", err)
+			return true
+		}
+		if ev.ThreadHasBot {
+			b.markPiThread(ev.Thread)
+			return true
+		}
+		// A thread pi-chat has never spoken in is an intrusion decision rather than a continuation one, so
+		// it is put to the room classifier - the prompt that weighs "would answering this be barging in" -
+		// instead of being ignored on a guess. That is what makes "so what's the scoop mr. bot, are you
+		// working today or not?" recoverable while leaving two people mid-argument alone.
+		return b.cfg.GateRoomRootMode == "dry-run" || b.cfg.GateRoomRootMode == "enforce"
+	}
 	owned, err := b.chat.HasBotMessage(ctx, ev.Space, ev.Thread)
 	if err != nil {
 		b.log.Warn("thread ownership lookup failed", "space", ev.Space, "thread", ev.Thread, "err", err)
@@ -882,6 +989,64 @@ func (b *Bridge) groupMessageEligible(ctx context.Context, ev *chatmsg.Event) bo
 		b.markPiThread(ev.Thread)
 	}
 	return owned
+}
+
+// readContext fills in what the message arrived inside: the transcript, and whether pi-chat already
+// speaks in this thread. One call per message; the history reader caches the space window for a few
+// seconds, so the identity lookup and the gate share it.
+//
+// The deadline is short and separate from the message's own context on purpose: a window read measured
+// 1.6s against the live API, and the gate call that needs it has 3s in total.
+func (b *Bridge) readContext(ctx context.Context, ev *chatmsg.Event) error {
+	if b.conv == nil || ev.Space == "" || ev.ContextRead {
+		return nil
+	}
+	readCtx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+	defer cancel()
+	c, err := b.conv.Context(readCtx, ev.Space, ev.Thread)
+	if err != nil {
+		return err
+	}
+	ev.ContextRead = true
+	ev.Conversation = c.Transcript
+	for _, p := range c.People {
+		if p.Bot {
+			ev.ThreadHasBot = true
+			break
+		}
+	}
+	return nil
+}
+
+// identityFromWindow answers "who sent this" from the messages around it. The room listener ships a
+// sender as {"name":"users/<id>","type":"HUMAN"} with no email, while messages.list in the same space
+// ships the same id with an email Chat publishes next to it - so the read that provides context also
+// provides the identity, for a person who has never once tagged the app.
+func (b *Bridge) identityFromWindow(ctx context.Context, ev *chatmsg.Event) (string, string, bool) {
+	c, err := b.conv.Context(ctx, ev.Space, "")
+	if err != nil {
+		b.log.Warn("conversation window unreadable, so the sender is unidentified",
+			"space", ev.Space, "id", ev.UserID, "err", err)
+		return "", "", false
+	}
+	known := map[string]bool{}
+	for _, k := range identityKeys(ev) {
+		known[k] = true
+	}
+	if len(known) == 0 {
+		return "", "", false
+	}
+	for _, p := range c.People {
+		if p.Email == "" {
+			continue
+		}
+		for _, alias := range identityAliases(p.ID) {
+			if known[alias] {
+				return p.Email, p.ID, true
+			}
+		}
+	}
+	return "", "", false
 }
 
 func isTopLevel(ev *chatmsg.Event) bool {

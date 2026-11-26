@@ -174,13 +174,13 @@ type recordingGate struct {
 	review *review
 }
 
-func (g *recordingGate) Classify(ctx context.Context, flow, summary, sender, message string) (string, string, time.Duration, error) {
-	answer, prompt, latency, err := g.inner.Classify(ctx, flow, summary, sender, message)
-	g.review.record(flow, sender, message, answer, prompt, latency, err)
+func (g *recordingGate) Classify(ctx context.Context, req chatgate.Request) (string, string, time.Duration, error) {
+	answer, prompt, latency, err := g.inner.Classify(ctx, req)
+	g.review.record(req.Flow, req.Sender, req.Message, answer, prompt, latency, err, len(req.Transcript))
 	return answer, prompt, latency, err
 }
 
-func (r *review) record(flow, sender, message, answer, prompt string, latency time.Duration, err error) {
+func (r *review) record(flow, sender, message, answer, prompt string, latency time.Duration, err error, contextChars int) {
 	verdict := "answer"
 	switch {
 	case err != nil:
@@ -189,6 +189,11 @@ func (r *review) record(flow, sender, message, answer, prompt string, latency ti
 		verdict = "stay quiet"
 	}
 	line := fmt.Sprintf("  gate %s -> %q (%s) => %s", flow, answer, latency.Round(10*time.Millisecond), verdict)
+	if contextChars > 0 {
+		// The context length is printed because a dry-run review that cannot tell whether the model saw
+		// the conversation cannot explain its own verdicts.
+		line += fmt.Sprintf(" [context %d chars]", contextChars)
+	}
 	if err != nil {
 		line += fmt.Sprintf(" err=%v", err)
 	}

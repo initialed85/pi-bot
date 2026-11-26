@@ -41,9 +41,27 @@ func PromptText(flow string) (string, error) {
 	return string(data), nil
 }
 
+// Request is one gate decision. It is a struct rather than five strings because the decision now has a
+// conversation in it, and a call site that reads `Classify(ctx, flow, summary, sender, message, "")`
+// cannot tell you which of those the empty string was.
+type Request struct {
+	// Flow selects the prompt template: FlowShouldRespond, FlowRoomRespond, FlowThreadRequest, FlowSummary.
+	Flow string
+	// Summary is the running thread summary, or for a room message what pi-chat last said there.
+	Summary string
+	// Sender is a display name, never an email address: the classifier does not need to know who is
+	// writing in order to tell whether they are writing to it.
+	Sender string
+	// Message is the text being decided on, exactly as it arrived.
+	Message string
+	// Transcript is the conversation the message sits in, oldest first, as Google Chat published it.
+	// Empty means the bridge could not read it, which is a different state from a room with nothing in it.
+	Transcript string
+}
+
 // Classifier is deliberately small so bridge tests can make every model decision deterministic.
 type Classifier interface {
-	Classify(ctx context.Context, flow string, summary, sender, message string) (answer string, prompt string, latency time.Duration, err error)
+	Classify(ctx context.Context, req Request) (answer string, prompt string, latency time.Duration, err error)
 }
 
 type Client struct {
@@ -106,13 +124,13 @@ func (c *Client) WithSchedule(deadlines ...time.Duration) *Client {
 
 // Classify asks the model, retrying within the attempt schedule. It reports the total time spent
 // across every attempt, because that is the number the bridge actually waits for.
-func (c *Client) Classify(ctx context.Context, flow, summary, sender, message string) (string, string, time.Duration, error) {
-	prompt, err := prompt(flow, summary, sender, message)
+func (c *Client) Classify(ctx context.Context, req Request) (string, string, time.Duration, error) {
+	prompt, err := prompt(req)
 	if err != nil {
 		return "", "", 0, err
 	}
 	limit := 4
-	if flow == FlowSummary {
+	if req.Flow == FlowSummary {
 		limit = 40
 	}
 	body, err := json.Marshal(map[string]any{
@@ -213,7 +231,7 @@ func (c *Client) Warm(ctx context.Context) error {
 			case <-timer.C:
 			}
 		}
-		_, _, _, last = c.Classify(warmCtx, FlowShouldRespond, "", "system", "ping")
+		_, _, _, last = c.Classify(warmCtx, Request{Flow: FlowShouldRespond, Sender: "system", Message: "ping"})
 		if last == nil {
 			c.warmMu.Lock()
 			c.warm = true
@@ -242,8 +260,8 @@ func (c *Client) KeepWarm(ctx context.Context) error {
 	return c.Warm(ctx)
 }
 
-func prompt(flow, summary, sender, message string) (string, error) {
-	name := flow
+func prompt(req Request) (string, error) {
+	name := req.Flow
 	if name == "" {
 		return "", fmt.Errorf("chatgate: empty flow")
 	}
@@ -251,11 +269,22 @@ func prompt(flow, summary, sender, message string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.NewReplacer(
-		"{summary}", summary,
-		"{sender}", first(sender, "a person"),
-		"{message}", message,
-	).Replace(template), nil
+	composed := strings.NewReplacer(
+		"{summary}", req.Summary,
+		"{sender}", first(req.Sender, "a person"),
+		"{message}", req.Message,
+	).Replace(template)
+	if strings.TrimSpace(req.Transcript) == "" {
+		return composed, nil
+	}
+	// The conversation goes before the template, not after it. The templates end with
+	// "Answer with exactly one word: YES or NO.", and that last line is what a small model is most
+	// reliably guided by; burying it under a transcript is how a one-word classifier starts writing
+	// paragraphs. The template text itself is vendored from the eval and stays byte-identical, so
+	// adding context here does not silently invalidate the measured prompt.
+	return "Conversation in this room so far, oldest first, in [time] who: what form. " +
+		"It is context for judging the message below, not itself a message to answer.\n" +
+		strings.TrimRight(req.Transcript, "\n") + "\n\n" + composed, nil
 }
 
 func first(value, fallback string) string {

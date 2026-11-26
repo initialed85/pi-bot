@@ -39,7 +39,7 @@ func TestClientClassifyUsesEvaluatedPromptAndContract(t *testing.T) {
 	defer server.Close()
 
 	client := New(server.URL, "test-model", time.Second)
-	answer, prompt, _, err := client.Classify(context.Background(), FlowShouldRespond, "a topic", "Ed", "what's up")
+	answer, prompt, _, err := client.Classify(context.Background(), Request{Flow: FlowShouldRespond, Summary: "a topic", Sender: "Ed", Message: "what's up"})
 	if err != nil || answer != "YES" || prompt == "" {
 		t.Fatalf("answer=%q prompt=%q err=%v", answer, prompt, err)
 	}
@@ -47,7 +47,7 @@ func TestClientClassifyUsesEvaluatedPromptAndContract(t *testing.T) {
 
 func TestClientClassifyRejectsUnknownFlowAndHTTPError(t *testing.T) {
 	client := New("http://127.0.0.1:1", "test-model", 20*time.Millisecond)
-	if _, _, _, err := client.Classify(context.Background(), "unknown", "", "", ""); err == nil {
+	if _, _, _, err := client.Classify(context.Background(), Request{Message: "m"}); err == nil {
 		t.Fatal("unknown flow succeeded")
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -55,7 +55,7 @@ func TestClientClassifyRejectsUnknownFlowAndHTTPError(t *testing.T) {
 	}))
 	defer server.Close()
 	client = New(server.URL, "test-model", time.Second)
-	if _, _, _, err := client.Classify(context.Background(), FlowSummary, "", "", "message"); err == nil {
+	if _, _, _, err := client.Classify(context.Background(), Request{Flow: FlowSummary, Message: "message"}); err == nil {
 		t.Fatal("HTTP error succeeded")
 	}
 }
@@ -156,7 +156,7 @@ func TestClassifyRetriesAfterTransportFailureAndReportsTotalWait(t *testing.T) {
 
 	client := New(server.URL, "test-model", 0).WithSchedule(200*time.Millisecond, 200*time.Millisecond)
 	started := time.Now()
-	answer, _, latency, err := client.Classify(context.Background(), FlowShouldRespond, "", "a person", "hello")
+	answer, _, latency, err := client.Classify(context.Background(), Request{Flow: FlowShouldRespond, Sender: "a person", Message: "hello"})
 	if err != nil {
 		t.Fatalf("retry did not recover: %v", err)
 	}
@@ -178,7 +178,7 @@ func TestClassifyStopsAfterTheScheduleIsSpent(t *testing.T) {
 
 	client := New(server.URL, "test-model", 30*time.Millisecond).WithSchedule(30*time.Millisecond, 30*time.Millisecond, 30*time.Millisecond)
 	started := time.Now()
-	if _, _, _, err := client.Classify(context.Background(), FlowShouldRespond, "", "", "message"); err == nil {
+	if _, _, _, err := client.Classify(context.Background(), Request{Flow: FlowShouldRespond, Message: "message"}); err == nil {
 		t.Fatal("classification unexpectedly succeeded")
 	}
 	if calls.Load() != 3 {
@@ -186,5 +186,46 @@ func TestClassifyStopsAfterTheScheduleIsSpent(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("classification took %s, the attempt schedule was not enforced", elapsed)
+	}
+}
+
+// The templates end with "Answer with exactly one word: YES or NO." and a small model follows the last
+// instruction it sees, so a transcript must never land below that line. This pins the composition, and
+// that the vendored template text itself is left byte-identical above and below the placeholders.
+func TestPromptPutsTheTranscriptAboveTheInstruction(t *testing.T) {
+	template, err := PromptText(FlowRoomRespond)
+	if err != nil {
+		t.Fatalf("template: %v", err)
+	}
+	transcript := "[03:25] ed: so what's the scoop mr. bot\n[04:04] amy: he is asleep\n"
+	got, err := prompt(Request{Flow: FlowRoomRespond, Summary: "earlier answer", Sender: "ed",
+		Message: "still no non-mentions then", Transcript: transcript})
+	if err != nil {
+		t.Fatalf("prompt: %v", err)
+	}
+	if !strings.HasPrefix(got, "Conversation in this room so far") || !strings.Contains(strings.SplitN(got, "\n", 2)[1], "[03:25] ed:") {
+		t.Fatalf("transcript not first: %q", got[:120])
+	}
+	if !strings.HasSuffix(strings.TrimSpace(got), "Answer with exactly one word: YES or NO.") {
+		t.Fatalf("the one-word instruction is no longer the last thing the model reads: %q", got[len(got)-80:])
+	}
+	if strings.Index(got, transcript) > strings.Index(got, "Message (from ed)") {
+		t.Fatal("transcript lands after the message it is context for")
+	}
+	body := strings.SplitN(got, "\n\n", 2)[1]
+	if !strings.Contains(body, "Pi-chat's most recent answer in this room, empty if it has not spoken recently: earlier answer") {
+		t.Fatalf("summary placeholder misplaced: %q", body)
+	}
+	if !strings.Contains(body, strings.TrimSuffix(template, "\n")[:200]) && !strings.Contains(body, template[:200]) {
+		t.Fatal("template text was altered")
+	}
+	// No transcript must reproduce today's prompt exactly, so a context read that fails cannot change
+	// the behaviour that has already been measured.
+	bare, err := prompt(Request{Flow: FlowRoomRespond, Summary: "earlier answer", Sender: "ed", Message: "still no non-mentions then"})
+	if err != nil {
+		t.Fatalf("bare prompt: %v", err)
+	}
+	if strings.Contains(bare, "Conversation in this room so far") {
+		t.Fatal("empty transcript still composed a header")
 	}
 }

@@ -174,25 +174,26 @@ func TestHistory_OwnershipComesFromTheWindow(t *testing.T) {
 	if owned {
 		t.Fatal("a thread with no bot message is not owned")
 	}
-	if hr.Calls() != 4 {
-		t.Fatalf("calls=%d, want one window read and one root read per thread, queries=%v", hr.Calls(), h.queries)
+	if hr.Calls() != 3 {
+		t.Fatalf("calls=%d, want one shared space window read and one root read per thread, queries=%v", hr.Calls(), h.queries)
 	}
 	// A repeat on the same key must not reach the API again; this is the difference between a message
 	// costing two Chat reads and costing four because the mention path and the gate path each asked.
 	if _, err := hr.HasBotMessage(context.Background(), "spaces/S", "spaces/S/threads/T"); err != nil {
 		t.Fatalf("repeat ownership: %v", err)
 	}
-	if hr.Calls() != 4 {
+	if hr.Calls() != 3 {
 		t.Fatalf("repeat read was not served from cache: calls=%d", hr.Calls())
 	}
 }
 
-// One message should not cost the pipeline several Chat reads: the mention path and the gate path ask
-// for the same window within a second of each other.
+// One message should not cost the pipeline several Chat reads: the identity lookup and the gate path ask
+// for the same space window within a second of each other, and only the thread root is specific to one.
 func TestHistory_CachesTheWindowBriefly(t *testing.T) {
 	h, hr := newHistoryHarness(t)
 	defer h.close()
 	h.listBody = `{"messages":[` + msgJSON("spaces/S/messages/m.m", "spaces/S/threads/T", "users/2", "ed@example.com", "initialed85 _", "HUMAN", "hi", since(1)) + `]}`
+	h.rootBody = msgJSON("spaces/S/messages/T.T", "spaces/S/threads/T", "users/2", "ed@example.com", "initialed85 _", "HUMAN", "root", since(20))
 	if _, err := hr.Context(context.Background(), "spaces/S", "spaces/S/threads/T"); err != nil {
 		t.Fatalf("first: %v", err)
 	}
