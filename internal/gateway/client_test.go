@@ -45,7 +45,9 @@ func TestClient_PromptAndTurn(t *testing.T) {
 				t.Errorf("deliverAs = %q, want steer", got.DeliverAs)
 			}
 			w.WriteHeader(http.StatusAccepted)
-			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "turnId": "abc", "folded": true})
+			// queued/compacting are why an answer can be slow without anything being wrong. The bridge logs
+			// them so "two minutes" is diagnosable as a serialised queue or a context rewrite, not a mystery.
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "turnId": "abc", "folded": true, "queued": true, "compacting": true})
 		case r.URL.Path == "/v1/turns/abc":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"id": "abc", "status": "settled", "text": "the answer", "turns": 4,
@@ -70,6 +72,9 @@ func TestClient_PromptAndTurn(t *testing.T) {
 	}
 	if resp.TurnID != "abc" || !resp.Folded {
 		t.Errorf("prompt resp = %+v", resp)
+	}
+	if !resp.Queued || !resp.Compacting {
+		t.Errorf("the gateway's hold reason did not survive decoding: %+v", resp)
 	}
 
 	turn, err := c.Turn(context.Background(), "abc")
@@ -106,7 +111,7 @@ func TestClient_StateAndCommands(t *testing.T) {
 		case "/v1/state":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"idle": false, "hasPendingMessages": true, "sessionName": "pi-chat",
-				"model": "rooter/beamster", "thinkingLevel": "high", "commands": 21,
+				"model": "rooter/beamster", "thinkingLevel": "high", "commands": 21, "compacting": true,
 				"contextUsage": map[string]any{"tokens": 50000, "contextWindow": 131072, "percent": 38.1},
 			})
 		case "/v1/commands":
@@ -139,6 +144,11 @@ func TestClient_StateAndCommands(t *testing.T) {
 	}
 	if state.ContextUsage.Tokens != 50000 {
 		t.Errorf("contextUsage = %+v", state.ContextUsage)
+	}
+	// The watch consults this before it tells a human their message is "queued behind other work", which
+	// during a compaction is simply the wrong sentence.
+	if !state.Compacting {
+		t.Errorf("compacting did not survive decoding: %+v", state)
 	}
 	cmds, err := c.Commands(context.Background())
 	if err != nil || len(cmds) != 1 || cmds[0].Name != "chat-gateway" {

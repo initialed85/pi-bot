@@ -167,6 +167,24 @@ export default function activate(pi: ExtensionAPI) {
   const pending: Turn[] = [];
   let active: Turn | undefined;
   let ctxRef: ExtensionContext | undefined;
+  /**
+   * True while a compaction - Pi's own threshold path or the idle scheduler - is rewriting the context.
+   *
+   * Pi refuses a prompt outright during that window: `prompt()` throws "Cannot submit a prompt while
+   * compaction is in progress", and no extension event runs before the check, so nothing can intercept
+   * it. For the person in the pane that is invisible (the message goes in the queue a moment later); for
+   * a Chat message it used to mean the bridge answered the human with "Couldn't reach Pi". Measured cost
+   * of one compaction here: 55 s (this fleet: 70 s median, 226 s p90), which is longer than anybody
+   * waiting for a reply should have to sit through with an error.
+   *
+   * So a prompt that arrives mid-compaction is held in `pending` here, and sent when the context is
+   * rewritten. The alternative - let Pi refuse and let the bridge apologise - loses the message.
+   */
+  let compacting = false;
+  let compactSince = 0;
+  let compactTimer: ReturnType<typeof setInterval> | undefined;
+  /** A missed end event must not wedge the chat path, so the flag is allowed to expire on a timer. */
+  const COMPACT_WEDGE_MS = 5 * 60_000;
   let server: ReturnType<typeof createServer> | undefined;
   let paneRuns = 0;
 
@@ -184,7 +202,7 @@ export default function activate(pi: ExtensionAPI) {
   // pump sends the oldest queued Chat message, but only into an idle session. Until then the turn stays
   // "queued" and the bridge simply keeps waiting, which is the honest state.
   function pump() {
-    if (!pending.length || active) return;
+    if (!pending.length || active || compacting) return;
     const ctx = ctxRef;
     if (!ctx || !ctx.isIdle()) return;
     const turn = pending.shift()!;
@@ -194,11 +212,59 @@ export default function activate(pi: ExtensionAPI) {
     try {
       pi.sendUserMessage(turn.content || []);
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (isCompactionRefusal(message)) {
+        // The `compacting` flag is driven by events; this is the case where the events disagree with
+        // what Pi actually does. Put it back at the head of the queue, keep the order, and stop claiming
+        // the turn is running.
+        pending.unshift(turn);
+        turn.status = "queued";
+        turn.startedAt = undefined;
+        active = undefined;
+        note(turn);
+        holdForCompactionEnd();
+        return;
+      }
       turn.status = "error";
-      turn.error = error instanceof Error ? error.message : String(error);
+      turn.error = message;
       turn.settledAt = Date.now();
     }
     note(turn);
+  }
+
+  /** The one sentence Pi throws while a compaction owns the session. */
+  function isCompactionRefusal(message: string | undefined): boolean {
+    return typeof message === "string" && /compaction is in progress/i.test(message);
+  }
+
+  function holdForCompactionEnd() {
+    if (!compacting) {
+      compacting = true;
+      compactSince = Date.now();
+    }
+    if (compactTimer) return;
+    // Poll rather than trusting the events alone: an aborted compaction (the idle scheduler's deadline
+    // calls ctx.abort()) has been seen to leave no clean end event, and a queued Chat message with no
+    // route to a retry is a lost message.
+    compactTimer = setInterval(() => {
+      if (compacting && Date.now() - compactSince > COMPACT_WEDGE_MS) {
+        ctxRef?.ui.notify("pi-chat-gateway: gave up waiting on a compaction that never reported back; resuming", "warning");
+        leaveCompaction("watchdog");
+      }
+      if (!compacting) return;
+      pump();
+      if (!pending.length && !active) leaveCompaction("drained");
+    }, 1000);
+  }
+
+  function leaveCompaction(reason: string) {
+    compacting = false;
+    if (compactTimer) {
+      clearInterval(compactTimer);
+      compactTimer = undefined;
+    }
+    if (reason === "watchdog") ctxRef?.ui.notify("pi-chat-gateway: compaction wait released", "info");
+    pump();
   }
 
   // ---------------------------------------------------------------- outbound (agent-initiated posts)
@@ -352,6 +418,10 @@ export default function activate(pi: ExtensionAPI) {
 
   off.push(
     pi.on("session_shutdown", async () => {
+      if (compactTimer) {
+        clearInterval(compactTimer);
+        compactTimer = undefined;
+      }
       const closing = server;
       server = undefined;
       if (!closing) return;
@@ -361,6 +431,31 @@ export default function activate(pi: ExtensionAPI) {
         // best effort
       }
       closing.close();
+    }),
+  );
+
+  // A compaction owns the session: Pi refuses prompts while it runs, so the queue waits here instead of
+  // being thrown at a shut door. These events cover both paths - Pi's own threshold compaction and the
+  // idle scheduler's - and `session_compact_failed` matters most: it means Pi gave up, so a held Chat
+  // message should be sent now rather than apologise.
+  off.push(
+    pi.on("session_before_compact", async (_event, ctx) => {
+      ctxRef = ctx;
+      holdForCompactionEnd();
+    }),
+  );
+
+  off.push(
+    pi.on("session_compact", async (_event, ctx) => {
+      ctxRef = ctx;
+      leaveCompaction("session_compact");
+    }),
+  );
+
+  off.push(
+    pi.on("session_compact_failed", async (_event, ctx) => {
+      ctxRef = ctx;
+      leaveCompaction("session_compact_failed");
     }),
   );
 
@@ -618,6 +713,9 @@ export default function activate(pi: ExtensionAPI) {
         version: VERSION,
         idle: ctx ? ctx.isIdle() : true,
         hasPendingMessages: ctx ? ctx.hasPendingMessages() : false,
+        // The bridge reports this when an answer is slow: "waiting on a compaction" is a different wait
+        // from "Pi is thinking", and a human reading a stale 👀 deserves to know which.
+        compacting,
         sessionId: ctx?.sessionManager.getSessionId(),
         sessionName: pi.getSessionName(),
         cwd: ctx?.cwd,
@@ -697,7 +795,9 @@ export default function activate(pi: ExtensionAPI) {
       // Only a steer joins the run that is going. A follow-up waits for it, so it keeps its own turn -
       // without that, every Chat message sent while Pi was busy got the same single answer.
       const folding = busy && deliverAs === "steer";
-      const queued = busy && deliverAs === "followUp";
+      // During a compaction nothing is running to fold into and Pi refuses the send outright, so every
+      // delivery mode becomes a queue. The answer is the same one it would have been a minute later.
+      const queued = (busy && deliverAs === "followUp") || compacting;
       turn.content = content;
       note(turn);
       try {
@@ -717,8 +817,21 @@ export default function activate(pi: ExtensionAPI) {
           turn.startedAt = Date.now();
         }
       } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (isCompactionRefusal(message)) {
+          // Same story from the other direction: Pi said no, so we hold it and send it when the context
+          // rewrite finishes, rather than handing the human an error for a message that is not lost.
+          turn.status = "queued";
+          pending.unshift(turn);
+          compacting = true;
+          compactSince = Date.now();
+          holdForCompactionEnd();
+          note(turn);
+          sendJson(response, 202, { ok: true, turnId: id, folded: false, id, queued: true, compacting: true });
+          return;
+        }
         turn.status = "error";
-        turn.error = error instanceof Error ? error.message : String(error);
+        turn.error = message;
         turn.settledAt = Date.now();
         sendJson(response, 500, { error: turn.error, id });
         return;

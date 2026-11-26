@@ -1507,8 +1507,17 @@ func (b *Bridge) watch(base context.Context, w *watch, start time.Time) {
 		if !started && !queuedNotice && time.Since(start) > b.cfg.MaxWait {
 			// Better than a bubble that claims work which has not happened.
 			queuedNotice = true
-			b.setStatus(w, bubble, "⏳ Pi has not started on that yet - it is queued behind other work. Send /stop to clear the queue, or message again.")
-			b.log.Info("turn still queued", "turn", w.turnID, "waited", humanDuration(time.Since(start)))
+			// "queued behind other work" is the wrong sentence when Pi is rewriting its own context: the
+			// gateway holds the prompt on purpose until the compaction lands, and a compaction is a couple of
+			// minutes of expected delay, not a stuck session. Ask which it is before telling the human.
+			notice := "⏳ Pi has not started on that yet - it is queued behind other work. Send /stop to clear the queue, or message again."
+			compact := false
+			if st, err := b.gw.State(poll); err == nil && st.Compacting {
+				compact = true
+				notice = "⏳ Pi is compacting its context right now (it takes a couple of minutes). Your message is held, not lost, and it will be answered as soon as that finishes."
+			}
+			b.setStatus(w, bubble, notice)
+			b.log.Info("turn still queued", "turn", w.turnID, "waited", humanDuration(time.Since(start)), "compacting", compact)
 			continue
 		}
 		thinkingShown = b.showThinking(w, bubble, thinkingShown)

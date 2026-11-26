@@ -43,6 +43,14 @@ type PromptResponse struct {
 	Folded bool   `json:"folded"`
 	ID     string `json:"id"`
 	Error  string `json:"error"`
+	// Queued means the gateway is holding the prompt rather than handing it to Pi right now: either a run
+	// is going that this delivery mode will not fold into, or a compaction owns the session and Pi refuses
+	// prompts until it finishes. The watch loop already handles it; it is recorded because "the answer took
+	// two minutes" has two very different causes and only one of them is a slow model.
+	Queued bool `json:"queued"`
+	// Compacting is the specific case: a context rewrite is in flight (measured 55 s here, 70 s median
+	// across the fleet's own sessions), so the wait is expected rather than a symptom.
+	Compacting bool `json:"compacting"`
 }
 
 type Input struct {
@@ -119,6 +127,8 @@ type State struct {
 	Model         string `json:"model"`
 	ThinkingLevel string `json:"thinkingLevel"`
 	ActiveTurn    string `json:"activeTurn"`
+	// Compacting reports a context rewrite in flight; the gateway holds Chat prompts until it lands.
+	Compacting  bool `json:"compacting"`
 	Turns         int    `json:"turns"`
 	Commands      int    `json:"commands"`
 	ContextUsage  struct {
