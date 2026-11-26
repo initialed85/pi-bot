@@ -240,3 +240,40 @@ spaces to this process. Only identity fields are read and the text is discarded.
 reach than "the group room": a two-human DM (Chat reports `DIRECT_MESSAGE`, and `SpaceInfo.DM()` trusts
 `singleUserBotDm` instead, so it is routed like a room) is included, and an allowlisted person in one is
 resolvable there.
+## 2026-11-26: the same window answers ownership and context, and one read serves all three
+
+The ownership question - "has pi-chat already spoken in this thread?" - was answered by
+`chatapi.HasBotMessage`, an **app-credential** read of `spaces/<id>/threads/<t>/messages`. Under the
+consumer app that read returns `403 ACCESS_TOKEN_SCOPE_INSUFFICIENT`, and `groupMessageEligible` treated
+the error as "not eligible". The consequence was not a wrong verdict, it was no verdict: the message never
+reached a model, never got a status bubble, and produced no log line the review tooling could see. The
+live case is 2026-11-26T03:25:08Z, `so what's the scoop mr. bot, are you working today or not?`, which the
+classifier judges **YES 5/5** with and without context (`eval/chat-gate/eval-context.mjs`, case `cx-09`).
+Nothing about the gate was wrong with it; the ingestion path threw it away.
+
+Ownership now comes from the history read above, which already ships `sender.type` and the bot's own
+messages: `internal/chatevents/history.go` fetches a bounded window (newest-first, so a 2013 room does
+not return 20 ancient messages), keeps the thread's own messages when the window contains any, and
+fetches the thread root by name when it does not - `spaces/<s>/messages/<leaf>.<leaf>` is addressable
+even though `filter=thread = "..."` is refused as an invalid filter. Three questions, one call, because
+the read measured 1.62s against a ~300ms classifier call:
+
+| question | what it reads from the window |
+| --- | --- |
+| who sent this | `sender.name` + `sender.email` pairs, including the event's bare `users/<id>` |
+| is this our thread | any `sender.type == BOT` in it, or the root being ours |
+| what did the classifier see | the same messages rendered oldest-first, capped by `PI_CHAT_GATE_CONTEXT_MESSAGES` / `_CHARS` |
+
+An unreadable window is never a drop. Every read site logs and continues: eligibility returns true so the
+message still gets judged, and the classifier composes the byte-identical pre-context prompt when there is
+no transcript. `TestConversation_UnreadableWindowStillReachesTheClassifier` and
+`TestPrompt_NoTranscriptIsTheMeasuredPrompt` pin those two.
+
+What the window did **not** buy is worth writing down because it was the premise: showing the classifier
+the room changed no verdict across 10 cases and 3 repeats (`0` regressions, `0` NO-to-YES flips). The
+`room-respond` rule for "correcting what pi-chat last said" reads `{summary}`, and seeding `{summary}`
+from the window measured 0/5 too. The prompt edit that *would* answer meta-complaints made the room's
+own chatter about pi-chat answerable as well, so it was rejected rather than tuned. The window ships for
+ingestion correctness and for what Pi sees - pi-chat answering "still no non-mentions then i guess huh"
+on 2026-11-26 without ever being shown the 2026-11-23 thread root asking for a fortnightly pay schedule
+is the failure mode context removes.
