@@ -54,6 +54,8 @@ type journal struct {
 
 	mu    sync.Mutex
 	turns map[string]*pendingTurn
+	// decisionsWarned keeps a broken evidence file to a single warning; see decisions.go.
+	decisionsWarned bool
 	// answered is a small in-memory ring of turns that have been delivered, newest last. It exists only
 	// so a person quoting a notice back at us resolves to the question that notice was about; the file
 	// does not carry it, because that answer is already in Chat.

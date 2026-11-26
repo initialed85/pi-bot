@@ -961,6 +961,20 @@ func (b *Bridge) replyGate(ctx context.Context, ev *chatmsg.Event, message strin
 	// user and space are on this line because reviewing a dry-run means answering "who would the bot have
 	// replied to, and where", and a room judgement with no author is not reviewable - it is a count.
 	b.log.Info("reply gate", "thread", ev.Thread, "space", ev.Space, "user", ev.UserEmail, "flow", flow, "context_chars", len(ev.Conversation), "thread_has_bot", ev.ThreadHasBot, "prompt", prompt, "answer", answer, "latency_ms", time.Since(started).Milliseconds(), "action", loggedAction)
+	// The same judgement, on the persistent volume, because stdout dies with the pod and this line is the
+	// evidence a rollout-boundary review depends on. No message text - see decisions.go for why that is the
+	// line drawn.
+	b.journal.recordDecision(gateDecision{
+		Flow:         flow,
+		Action:       loggedAction,
+		Mode:         mode,
+		Space:        ev.Space,
+		Thread:       ev.Thread,
+		PromptID:     shortID(ev.MessageName),
+		ContextChars: len(ev.Conversation),
+		LatencyMS:    time.Since(started).Milliseconds(),
+		ThreadHasBot: ev.ThreadHasBot,
+	})
 	if flow == chatgate.FlowRoomRespond && mode != "enforce" {
 		// Dry-run measures the room classifier without putting new text in a shared room: a would-be
 		// room answer is logged and dropped, so reviewing the feature cannot itself be the noise.

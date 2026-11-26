@@ -9,7 +9,12 @@
 // destroyed); `--archive` appends the raw lines to a file OUTSIDE this repo so a rollout cannot
 // delete the evidence. Live transcripts are personal data - never archive them into a public tree.
 //
-// Reads live pod logs via kubectl (authoritative; no dependency on log shipping).
+// Reads live pod logs via kubectl, PLUS the durable verdict record the bridge keeps on its own volume at
+// /var/lib/pi-bot/gate-decisions.jsonl (see internal/bridge/decisions.go). The log window ends when the
+// pod is deleted; the file survives rollouts, which is the difference between "the gate behaved" and
+// "I cannot prove it". The file holds no message text by design, so rows from it render with an empty
+// message column - the log rows for the same decisions, if the pod still has them, carry the text.
+// Disable the merge with --no-durable (used by tests that feed --stdin).
 // Dry-run logs every decision it WOULD have made, so the "would have suppressed"
 // column is the actual risk of enforce - that is the list to read.
 import { spawnSync } from "node:child_process";
@@ -26,6 +31,35 @@ const tail = Number(flag("tail", 5000));
 const since = flag("since", "24h");
 const pod = flag("pod", null);
 const archive = flag("archive", null);
+const durableOn = !args.includes("--no-durable") && !args.includes("--stdin");
+
+// Durable path is derived from the journal file the deployment sets, not hardcoded twice.
+function podName() {
+  const out = spawnSync("kubectl", ["--context", ctx, "-n", ns, "get", "pod", "-l", "app=pi-bot-bridge",
+    "--field-selector=status.phase=Running", "-o", "jsonpath={.items[0].metadata.name}"], { encoding: "utf8" });
+  return out.status === 0 ? out.stdout.trim() : "";
+}
+
+function durableDecisions() {
+  const name = pod ? pod : podName();
+  if (!name) return [];
+  const out = spawnSync("kubectl", ["--context", ctx, "-n", ns, "exec", name, "--", "sh", "-c",
+    "for f in /var/lib/pi-bot/gate-decisions.jsonl /var/lib/pi-bot/gate-decisions.jsonl.1; do cat $f 2>/dev/null; done"],
+    { encoding: "utf8", maxBuffer: 32 << 20 });
+  if (out.status !== 0) return [];
+  const rows = [];
+  for (const line of (out.stdout || "").split("\n")) {
+    if (!line.startsWith("{")) continue;
+    let d; try { d = JSON.parse(line); } catch { continue; }
+    rows.push({
+      time: d.ts, flow: d.flow, action: d.action, answer: "", latency_ms: d.latency_ms,
+      thread: d.thread, space: d.space, user: "", context_chars: d.context_chars,
+      thread_has_bot: d.thread_has_bot, durable: true, prompt: "",
+    });
+  }
+  // Newest last, so a merged table reads in one direction regardless of which file it came from.
+  return rows.sort((a, b) => Date.parse(a.time) - Date.parse(b.time));
+}
 
 let raw;
 if (args.includes("--stdin")) {
@@ -49,10 +83,17 @@ for (const line of raw.split("\n")) {
   if (!line.startsWith("{")) continue;
   let j; try { j = JSON.parse(line); } catch { continue; }
   if (j.time && (earliest === null || Date.parse(j.time) < earliest)) earliest = Date.parse(j.time);
-  if (j.msg === "reply gate") decisions.push(j);
+  if (j.msg === "reply gate") decisions.push({ ...j, durable: false });
   else if (j.msg === "group message outside a pi-chat thread; ignoring") ignored.push(j);
   else if (j.msg === "reply gate warm-up failed") warm = `warm-up FAILED: ${j.err}`;
   else if (j.msg === "reply gate warm") warm = "warm-up ok";
+}
+
+// Merge: the log record wins where both exist, because it carries the prompt text.
+const seen = new Set(decisions.map((d) => key(d)));
+for (const d of durableDecisions()) if (!seen.has(key(d))) decisions.push(d);
+function key(d) {
+  return `${String(d.time ?? "").slice(0, 19)}|${d.flow}|${(d.thread ?? "").split("/").pop()}|${d.action}`;
 }
 
 // Two eras of failure handling live in these logs, and the labels are the only way to tell them
@@ -106,6 +147,7 @@ const rows = decisions.map((d) => {
     reroutes: /(^|-)thread$/.test(d.action ?? ""),
     fallback: /(^|-)fallback-/.test(d.action ?? ""),
     summary: s >= 0 ? lines.slice(s + 1).find((l) => l.trim() !== "")?.trim().slice(0, 60) ?? "" : "",
+    durable: !!d.durable,
   };
 });
 
@@ -122,8 +164,11 @@ if (windowMs && earliest !== null && Date.now() - earliest > windowMs * 0.9) {
   // logs really do cover the window
 } else if (windowMs && earliest !== null) {
   const covered = Math.round((Date.now() - earliest) / 60000);
-  console.log(`\nEVIDENCE BOUNDARY: asked for ${since}, but these logs only reach back ~${covered} min.`);
-  console.log("Anything older is gone - the pod that held it was deleted, and there is no log shipping.");
+  const durableRows = rows.filter((r) => r.durable);
+  console.log(`\nEVIDENCE BOUNDARY: asked for ${since}, but this pod's logs only reach back ~${covered} min.`);
+  console.log(durableRows.length
+    ? `Older decisions come from the durable record on the bridge's volume (${durableRows.length} rows); they carry no message text.`
+    : "Anything older is gone, and the durable record has nothing in this window either.");
   console.log("A quiet table therefore means 'the gate was never consulted', not 'the gate behaved'.");
 }
 if (!rows.length) {
@@ -133,7 +178,7 @@ if (!rows.length) {
 }
 console.log(`\ntime     flow              answer   ms     action                 message`);
 for (const r of rows)
-  console.log(`${r.time}  ${r.flow.padEnd(17)} ${(r.answer ?? "").padEnd(8)} ${String(r.ms).padStart(4)}  ${(r.action ?? "").padEnd(20)} ${r.message}`);
+  console.log(`${r.time}  ${String(r.flow).padEnd(17)} ${(r.answer ?? "").padEnd(8)} ${String(r.ms).padStart(4)}  ${(r.action ?? "").padEnd(20)} ${r.message || (r.durable ? "(durable record - no text stored)" : "")}`);
 const would = rows.filter((r) => r.suppresses);
 const rerouted = rows.filter((r) => r.reroutes);
 console.log(`\n== ${rows.length} decisions`);

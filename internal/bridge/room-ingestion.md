@@ -399,3 +399,25 @@ that deletes typed text is worse than one that misses a lookalike. The gateway k
 `cleanTurnTokens` for prompts that arrive with a marker still in them, and records the fragments on the
 turn (`refs`) so `/status` can show which earlier turn a message was about - resolution stays bridge-side
 because that is where the journal is.
+
+## 2026-11-26T09:52Z: verdicts on the volume, because stdout dies with the pod
+
+I reported room-gate evidence to Ed that turned out to be unsupportable: the pod I quoted from had been
+replaced, its log destroyed, and there is nothing to query afterwards. Ed's answer to the fix I proposed
+("ship the bridge's stdout somewhere") was a flat no — *"i don't wanna ship logs anywhere man, i just want
+you to use persistent storage for your cross-pod-rollout state file"* — which is the same call he made for
+the turn journal, and the right one: the state file already lives on `pi-bot-bridge-state`.
+
+So the evidence goes on that volume too. `internal/bridge/decisions.go` appends one JSON line per
+reply-gate judgement to `/var/lib/pi-bot/gate-decisions.jsonl`, rotating to `.1` at 1 MiB, best-effort and
+warn-once: a full or read-only disk must not cost anybody their answer.
+
+The line carries the verdict and the measurement — `ts, flow, action, mode, space, thread, prompt id,
+context_chars, latency_ms, thread_has_bot` — and **no participant text**. That boundary is deliberate:
+printing a judged message to a terminal Ed owns is one thing, accumulating other people's sentences on a
+volume is another, and the question a review actually asks ("did it suppress this, would it again, how
+long did it take") is answerable without them.
+
+`gate-logs.mjs` now merges that file with whatever the current pod's log still holds, log rows winning
+where the same decision appears in both because they carry the prompt text. A rollout-boundary review can
+therefore say what the gate did across a deploy instead of starting from the moment the new pod woke up.
