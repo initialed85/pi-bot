@@ -142,6 +142,15 @@ type Config struct {
 	// MaxWait bounds a watch. Past it the bridge stops watching and says so; the Pi run is left
 	// alone, because aborting someone's long job because a chat got impatient is the wrong default.
 	MaxWait time.Duration
+	// DrainWait is how long a shutting-down bridge stays alive waiting for turns that are still running,
+	// so a rollout delivers answers instead of posting "the bridge stopped" over somebody's question. It
+	// must be shorter than terminationGracePeriodSeconds, or Kubernetes SIGKILLs us mid-drain and the
+	// whole knob is decoration.
+	DrainWait time.Duration
+	// JournalFile persists the turns the bridge still owes - who asked, and where the answer belongs -
+	// so a process that dies mid-turn can deliver the answer when it comes back. Empty keeps the record
+	// in memory only, which is the right default for tests and local runs.
+	JournalFile string
 	// MaxChars is the per-message text limit used for chunking. The API rejects anything over 32,000
 	// characters on both create and patch (measured, see spike/FINDINGS.md), and mentions/links count
 	// as citations against that budget, so the default leaves headroom.
@@ -204,6 +213,7 @@ func DefaultConfig() Config {
 		Eyes:                  "\U0001f440",
 		Thinking:              "\U0001f914",
 		MaxWait:               30 * time.Minute,
+		DrainWait:             75 * time.Second,
 		MaxChars:              30000,
 		ImageMaxBytes:         4 << 20,
 		MaxImages:             4,
@@ -250,6 +260,12 @@ func (c Config) withDefaults() Config {
 	}
 	if c.MaxWait > 0 {
 		d.MaxWait = c.MaxWait
+	}
+	if c.DrainWait > 0 {
+		d.DrainWait = c.DrainWait
+	}
+	if c.JournalFile != "" {
+		d.JournalFile = c.JournalFile
 	}
 	if c.MaxChars >= 200 {
 		d.MaxChars = c.MaxChars
@@ -346,6 +362,12 @@ type Bridge struct {
 	gate      chatgate.Classifier
 	lastSpace string
 	watchers  sync.WaitGroup
+	// journal holds the turns still owed, and watchCtx is the context a watch runs on: the process
+	// shutdown signal, not the Pub/Sub receive context that happened to deliver the message. That
+	// distinction is what lets a rollout finish a turn instead of abandoning it.
+	journal     *journal
+	watchCtx    context.Context
+	watchCancel context.CancelFunc
 }
 
 type watch struct {
@@ -358,6 +380,9 @@ type watch struct {
 	thread   string
 	replyID  string // deterministic client- id, so a redelivery cannot fork a second reply
 	statusID string // likewise for the status bubble, so a redelivery reuses the one already up
+	// bubble is the Chat message name the glyph is sitting in, carried on the watch so a recovered one
+	// can replace that same message with the late answer instead of posting a second notice.
+	bubble string
 
 	// queued is how long the session took to start on the prompt after the bridge dispatched it. It is
 	// the part of "after" that no amount of model speed can fix, so it gets its own number instead of
@@ -402,7 +427,11 @@ func New(chat Chat, gw Gateway, cfg Config, log *slog.Logger) *Bridge {
 		piThreads:   map[string]struct{}{},
 		gate:        gate,
 		conv:        resolved.Conversation,
+		journal:     openJournal(resolved.JournalFile, log),
 	}
+	// Watches outlive the message that created them on purpose: a rollout must keep the chance to answer
+	// the question it interrupted. Drain is what cancels this, after giving them their window.
+	b.watchCtx, b.watchCancel = context.WithCancel(context.Background())
 	// Identity bindings are the one piece of state a redeploy otherwise loses, and the room path needs
 	// them from the very first message. Seeding them from config is what makes a cold pod able to answer
 	// a room at all; runtime learning (bindIdentity) still adds to it.
@@ -1165,12 +1194,106 @@ func (b *Bridge) trackThread(base context.Context, promptID, turnID string, ev *
 	b.watches[ev.Space] = w
 	b.lastSpace = ev.Space
 	b.mu.Unlock()
+	// The origin is written down before anything can go wrong, because "where does this answer belong"
+	// is the one question a restarted bridge cannot re-derive: Pi knows the answer, and only this record
+	// knows who asked it.
+	b.journal.save(&pendingTurn{
+		PromptID: w.promptID,
+		TurnID:   w.turnID,
+		Space:    w.space,
+		Thread:   w.thread,
+		ReplyID:  w.replyID,
+		StatusID: w.statusID,
+		User:     ev.UserEmail,
+		Asked:    truncate(ev.Prompt(), 160),
+		Start:    time.Now(),
+		Expires:  time.Now().Add(3 * b.cfg.MaxWait),
+	})
+	b.startWatch(w, time.Now())
+}
+
+// startWatch runs one turn's delivery loop on the shutdown context, so a rollout can finish answering
+// the message it interrupted. trackThread and Recover share this so a recovered turn is delivered by
+// exactly the same code as a live one.
+func (b *Bridge) startWatch(w *watch, start time.Time) {
+	b.mu.Lock()
+	b.watches[w.space] = w
+	b.lastSpace = w.space
+	b.mu.Unlock()
 	b.watchers.Add(1)
-	start := time.Now()
 	go func() {
 		defer b.watchers.Done()
-		b.watch(base, w, start)
+		b.watch(b.watchCtx, w, start)
 	}()
+}
+
+// Drain gives running turns a window to deliver their answers before the process goes away, and cancels
+// the watches only once that window is up. It reports whether everything finished on its own; when it
+// did not, the owed turns stay in the journal for the next process to recover.
+func (b *Bridge) Drain(wait time.Duration) bool {
+	if wait <= 0 {
+		wait = b.cfg.DrainWait
+	}
+	done := make(chan struct{})
+	go func() {
+		b.watchers.Wait()
+		close(done)
+	}()
+	// Nothing new can arrive during a drain - the receive loop is stopped before this is called - so
+	// cancelling the watch context at the end is cleanup, not an interruption.
+	defer b.watchCancel()
+	select {
+	case <-done:
+		return true
+	case <-time.After(wait):
+	}
+	// Give up, and let each watch post the notice it is allowed to say last. Without that second window
+	// a drain that runs out of time leaves "working..." glyphs in threads we will never answer.
+	b.watchCancel()
+	notices := make(chan struct{})
+	go func() {
+		b.watchers.Wait()
+		close(notices)
+	}()
+	select {
+	case <-notices:
+	case <-time.After(15 * time.Second):
+	}
+	return false
+}
+
+// Recover delivers answers that a previous process was owed but never posted: a pod that died mid-turn,
+// or a rollout that drained past its window. Each owed turn is asked of the gateway, which still holds
+// the run, and handled by the same code path a live watch uses.
+func (b *Bridge) Recover(ctx context.Context) {
+	if b.journal == nil {
+		return
+	}
+	owed := b.journal.pending()
+	if len(owed) == 0 {
+		return
+	}
+	b.log.Info("recovering owed turns", "count", len(owed))
+	for _, p := range owed {
+		w := p.watch()
+		turn, err := b.gw.Turn(ctx, w.turnID)
+		switch {
+		case errors.Is(err, gateway.ErrUnknownTurn):
+			b.setStatus(w, w.bubble, "⚠️ I lost that question when the bridge restarted, and Pi has no record of it either. Send it again."+idSuffix(w.turnID))
+			b.journal.drop(w.promptID)
+			b.log.Warn("owed turn has no gateway record", "turn", w.turnID, "space", w.space, "asked", p.Asked)
+		case err != nil:
+			// The gateway is unreachable or still booting. Leave the record owed: dropping it here is how
+			// an answer would be lost for good on a transient error.
+			b.log.Warn("could not ask Pi about an owed turn; leaving it owed", "turn", w.turnID, "err", err)
+		case turn.Settled():
+			b.log.Info("delivering an answer the previous process never posted", "turn", w.turnID, "space", w.space, "user", p.User, "asked", p.Asked)
+			b.finish(w, w.bubble, turn, time.Since(p.Start))
+		default:
+			b.log.Info("owed turn is still running; watching it again", "turn", w.turnID, "space", w.space, "running_for", humanDuration(time.Since(p.Start)))
+			b.startWatch(w, time.Now())
+		}
+	}
 }
 
 // Watched reports the turn currently being reported into a space, if any.
@@ -1219,6 +1342,10 @@ func (b *Bridge) watch(base context.Context, w *watch, start time.Time) {
 	deadline := start.Add(b.cfg.MaxWait)
 
 	bubble := b.openStatus(w)
+	w.bubble = bubble
+	// The bubble name is part of the origin: it is what lets a later process replace the "thinking"
+	// message with the answer instead of adding a second notice on top of it.
+	b.journal.update(w.promptID, func(p *pendingTurn) { p.Status = bubble })
 	thinkingShown := false
 	failures := 0
 	started := false
@@ -1227,17 +1354,18 @@ func (b *Bridge) watch(base context.Context, w *watch, start time.Time) {
 	for {
 		select {
 		case <-base.Done():
-			// The bridge is going away. Say so in the thread rather than leaving a bubble that says
-			// "working" forever - it is the last thing we can tell that user.
-			b.setStatus(w, bubble, "⚠️ The bridge stopped while that was running, so it can't report the answer. Open the terminal (or message again) to see what Pi produced.")
+			// The bridge is going away after its drain window ran out. Say so in the thread rather than
+			// leaving a bubble that says "working" forever - it is the last thing we can tell that user -
+			// but keep the turn owed, because the answer may still exist and the next process can deliver it.
+			b.setStatus(w, bubble, "⚠️ The bridge is restarting while that was running. I will post the answer when it lands, if I still have it."+idSuffix(w.turnID))
 			return
 		case <-poll.Done():
 			if base.Err() == nil {
 				if !started {
-					b.setStatus(w, bubble, fmt.Sprintf("⌛️ Pi has not started on that in %s - it is queued behind other work. Send it again, or send /stop to clear the queue.", humanDuration(b.cfg.MaxWait*queuePatience)))
+					b.setStatus(w, bubble, fmt.Sprintf("⌛️ Pi has not started on that in %s - it is queued behind other work. Send it again, or send /stop to clear the queue.%s", humanDuration(b.cfg.MaxWait*queuePatience), idSuffix(w.turnID)))
 					b.log.Warn("queued turn never started", "turn", w.turnID, "waited", humanDuration(b.cfg.MaxWait*queuePatience))
 				} else {
-					b.setStatus(w, bubble, fmt.Sprintf("⌛️ Stopped watching after %s. Pi may still be running - send /status to check, or /stop to abort it.", humanDuration(b.cfg.MaxWait*queuePatience)))
+					b.setStatus(w, bubble, fmt.Sprintf("⌛️ Stopped watching after %s. Pi may still be running - send /status to check, or /stop to abort it.%s", humanDuration(b.cfg.MaxWait*queuePatience), idSuffix(w.turnID)))
 					b.log.Warn("stopped watching after the patience ceiling", "turn", w.turnID, "after", humanDuration(time.Since(start)), "queued", humanDuration(w.queued))
 				}
 			}
@@ -1247,14 +1375,15 @@ func (b *Bridge) watch(base context.Context, w *watch, start time.Time) {
 
 		turn, err := b.gw.Turn(poll, w.turnID)
 		if errors.Is(err, gateway.ErrUnknownTurn) {
-			b.setStatus(w, bubble, "⚠️ Pi has no record of that turn - the session probably restarted while it was running. Try again.")
+			b.setStatus(w, bubble, "⚠️ Pi has no record of that turn - the session probably restarted while it was running. Try again."+idSuffix(w.turnID))
+			b.journal.drop(w.promptID)
 			return
 		}
 		if err != nil {
 			failures++
 			b.log.Warn("poll failed", "turn", w.turnID, "err", err, "failures", failures)
 			if failures == 5 {
-				b.setStatus(w, bubble, "⚠️ Lost contact with Pi. It may still be working; check the terminal.")
+				b.setStatus(w, bubble, "⚠️ Lost contact with Pi. It may still be working; check the terminal."+idSuffix(w.turnID))
 			}
 			if failures > 30 {
 				return
@@ -1282,7 +1411,7 @@ func (b *Bridge) watch(base context.Context, w *watch, start time.Time) {
 		}
 
 		if started && time.Now().After(deadline) {
-			b.setStatus(w, bubble, fmt.Sprintf("⌛️ Still working, but I stopped watching after %s. Pi may still be running - send /status to check, or /stop to abort it.", b.cfg.MaxWait))
+			b.setStatus(w, bubble, fmt.Sprintf("⌛️ Still working, but I stopped watching after %s. Pi may still be running - send /status to check, or /stop to abort it.%s", b.cfg.MaxWait, idSuffix(w.turnID)))
 			b.log.Warn("turn outlived the watching deadline", "turn", w.turnID, "after", humanDuration(time.Since(start)), "queued", humanDuration(w.queued))
 			return
 		}
@@ -1342,6 +1471,8 @@ func (b *Bridge) showThinking(w *watch, bubble string, already bool) bool {
 // success retires the bubble so the thread is left holding only the answer.
 func (b *Bridge) finish(w *watch, bubble string, turn gateway.Turn, elapsed time.Duration) {
 	text := finalText(turn)
+	// Delivered, or deliberately given up on: either way this turn is no longer owed.
+	defer b.journal.drop(w.promptID)
 
 	// The turn that settled might not be ours: a session restart mid-queue, or a gateway that re-keyed
 	// the run. Posting somebody else's answer as a reply to this user's message would be a lie, and
@@ -1595,6 +1726,20 @@ func clientID(key string) string {
 }
 
 // shortID is the turn id: deterministic from the Chat message so a redelivery maps to the same turn.
+// idSuffix tags every notice the bridge posts with the turn it is talking about. Notices are the messages
+// most likely to be followed by "what happened to that one?", and the id is what turns that into a log
+// lookup instead of a guess.
+func idSuffix(turnID string) string {
+	id := strings.TrimSpace(turnID)
+	if id == "" {
+		return ""
+	}
+	if len(id) > 8 {
+		id = id[:8]
+	}
+	return " (id " + id + ")"
+}
+
 func shortID(messageName string) string {
 	if messageName == "" {
 		return fmt.Sprintf("%d", time.Now().UnixNano())

@@ -1570,6 +1570,8 @@ func TestWithDefaultsCarriesEveryConfigField(t *testing.T) {
 		Thinking:              "🤔",
 		PollInterval:          10 * time.Millisecond,
 		MaxWait:               2 * time.Second,
+		DrainWait:             5 * time.Second,
+		JournalFile:           filepath.Join(t.TempDir(), "turns.json"),
 		MaxChars:              4000,
 		ImageMaxBytes:         1 << 20,
 		MaxImages:             2,

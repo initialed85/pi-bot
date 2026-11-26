@@ -28,6 +28,10 @@
 //	PI_CHAT_THINKING           status glyph while Pi works (default 🤔; "none" skips the edit)
 //	PI_CHAT_POLL_SECONDS       gateway turn poll interval (default 2)
 //	PI_CHAT_MAX_WAIT_MINUTES   give up watching after this (default 30)
+//	PI_CHAT_DRAIN_SECONDS      how long a shutting-down bridge stays alive to finish turns it started
+//	                           (default 75; keep it under terminationGracePeriodSeconds)
+//	PI_CHAT_TURN_JOURNAL       file where turns still owed are recorded, so a restarted process can
+//	                           deliver an answer to the conversation that asked (default: none)
 //	PI_CHAT_IMAGE_MAX_MB       per-attachment download cap (default 4)
 //	PI_CHAT_MAX_IMAGES         attachments forwarded per message (default 4)
 //	PI_CHAT_REPLY_GATE_MODE    off|dry-run|enforce (default off; dry-run logs, enforce suppresses/reroutes)
@@ -153,6 +157,10 @@ func run() error {
 
 	httpServer := serveHealth(ctx, logger, s.httpAddr, gw, b)
 
+	// Answers that a previous process was owed but never posted - a pod that died mid-turn, a rollout
+	// that ran out of drain window - are delivered here, into the conversation that asked for them.
+	b.Recover(ctx)
+
 	// One key file, two services: the same app service account holds pubsub.subscriber (to read the
 	// Chat events) and chat.bot (to answer), so the bridge never needs workload identity or ADC.
 	client, err := pubsub.NewClient(ctx, s.project, option.WithCredentialsFile(s.keyFile))
@@ -215,15 +223,10 @@ func run() error {
 		logger.Info("shutting down; waiting for in-flight turns")
 	}
 
-	// Give in-flight turns a moment to post a final message rather than leaving a "working…" bubble.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	done := make(chan struct{})
-	go func() { b.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-shutdownCtx.Done():
-		logger.Warn("exiting with turns still running")
+	// Give in-flight turns their window to answer rather than leaving a "working…" bubble behind, and
+	// keep the ones we could not finish owed: the journal is what lets the next process deliver them.
+	if !b.Drain(0) {
+		logger.Warn("exiting with turns still running; they stay owed and are recovered on next start")
 	}
 	if httpServer != nil {
 		_ = httpServer.Shutdown(context.Background())
@@ -493,6 +496,13 @@ func loadSettings() (settings, error) {
 	s.cfg.PollInterval = seconds("PI_CHAT_POLL_SECONDS", s.cfg.PollInterval)
 
 	s.cfg.MaxWait = minutes("PI_CHAT_MAX_WAIT_MINUTES", s.cfg.MaxWait)
+	// A rollout used to abandon every running turn after 20 seconds, which put "the bridge stopped" in
+	// front of whoever asked a question. This is the window we stay alive to finish answering first; it
+	// must stay under terminationGracePeriodSeconds or Kubernetes kills us mid-drain anyway.
+	s.cfg.DrainWait = seconds("PI_CHAT_DRAIN_SECONDS", s.cfg.DrainWait)
+	// Where the owed turns are written, so a process that dies mid-turn can still deliver the answer to
+	// the conversation that asked. Empty means in-memory only: nothing survives a restart.
+	s.cfg.JournalFile = envDefault("PI_CHAT_TURN_JOURNAL", s.cfg.JournalFile)
 	// The classifier endpoint drops the model when a room goes quiet, and the next message pays for that
 	// load inside the answering path. A number here re-warms it that often in the background; "off" means
 	// warm once at boot and never again.

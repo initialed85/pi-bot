@@ -293,3 +293,45 @@ mode, in the order they matter:
   classifier with no transcript, and a classifier error in enforce answers rather than going silent.
 - `dry-run` remains the rollback, and it is the mode to return to if a real room conversation gets an
   answer it should not have. It is one value on one line.
+
+## 2026-11-26T07:00Z: a rollout must not swallow an answer
+
+Ed asked pi-chat for the weather at 06:32Z. Pi did the research and produced the answer. What Chat
+showed instead was:
+
+> ⚠️ The bridge stopped while that was running, so it can't report the answer. Open the terminal (or
+> message again) to see what Pi produced.
+
+Because at 06:36Z I pinned a new digest, and the watch that was carrying his question was running on
+**the Pub/Sub receive context**. Cancelling that context is the first thing shutdown does, so every
+in-flight watch died instantly and posted its surrender notice, while the 20-second drain window the
+process then waited out was spent doing nothing. The answer landed in the terminal. Nobody in Chat saw
+it. My rollout, his question - which is why this is fixed rather than explained.
+
+Two changes, in the order they matter:
+
+1. **Watches run on their own context** (`b.watchCtx`, created in `New`) and `Drain` decides when they
+   stop. A rollout now has `PI_CHAT_DRAIN_SECONDS` (default 75s) to finish answering the messages it
+   interrupted, and only when that runs out does anything post a notice. It has to stay under
+   `terminationGracePeriodSeconds`, or Kubernetes SIGKILLs us mid-drain and the knob is decoration -
+   the manifest raises the grace period to 120 in the same commit that ships this.
+2. **Turns still owed are written down** (`PI_CHAT_TURN_JOURNAL`, `internal/bridge/journal.go`): the
+   prompt id, the gateway turn id, the space, the thread, the reply and status client ids, and the
+   Chat message name the glyph is sitting in. On startup `Recover` asks the gateway about each one and
+   either delivers the answer into the conversation that asked - replacing that same status message
+   rather than adding a notice on top of it - re-attaches to a run still going, or says plainly that Pi
+   has no record of it. The record is dropped when the answer is delivered, so a recovery cannot post
+   the same reply twice.
+
+The journal holds routing, not text: no Pi output, and a 160-character echo of the question so a log
+line can say what was answered. It is bounded at 50 owed turns and expires records after three
+answering budgets, because a bridge that cannot deliver should stop rather than recover a backlog of
+stale answers into a live conversation.
+
+Storage caveat, stated so nobody mistakes the scope: the volume mounted today is an `emptyDir`, which
+dies with the pod. So the journal covers container restarts and crash loops; **rollouts are covered by
+the drain**, which is the case that actually bit. Making owed turns survive pod replacement needs a
+PVC, and that is a home-ops storage decision rather than something I add on my own.
+
+Every notice the bridge posts now carries `(id <turn-id>)`, because "what happened to that one?" should
+be a log lookup and not an archaeology exercise.
