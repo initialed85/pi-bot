@@ -447,6 +447,17 @@ func loadSettings() (settings, error) {
 	// "enforce".
 	s.cfg.GateRoomRootMode = envDefault("PI_CHAT_GATE_ROOM_ROOT", "ignore")
 
+	// How much of the room the classifier is shown. Bounded rather than "everything we can read": the
+	// window is fetched newest-first and a 4B model's attention is the scarce thing, not the network. A
+	// 1500-char budget was chosen against the measured 1.6s Chat read and ~300ms classifier call, and the
+	// eval that found the window costs no verdict used exactly these limits.
+	if v := ints("PI_CHAT_GATE_CONTEXT_MESSAGES"); v > 0 {
+		s.cfg.GateContextMessages = v
+	}
+	if v := ints("PI_CHAT_GATE_CONTEXT_CHARS"); v > 0 {
+		s.cfg.GateContextChars = v
+	}
+
 	// The room listener is a separate capability from the app path, and it is off by default: it reads
 	// every message in every space the authorising human belongs to, so enabling it is an explicit
 	// operator decision rather than a side effect of deploying a new image.

@@ -101,6 +101,8 @@ PI_CHAT_REPLY_GATE_TIMEOUT_SECONDS=3            # deadline for the first attempt
 PI_CHAT_REPLY_GATE_ATTEMPT_MS=3000,6000,12000   # every attempt; unset means double the previous one
 PI_CHAT_GATE_ROOM_ROOT=ignore      # ignore | dry-run | classify: what an untagged new room message gets
 PI_CHAT_GATE_KEEPALIVE_MINUTES=5   # re-warm the endpoint this often; "off" warms at boot only
+PI_CHAT_GATE_CONTEXT_MESSAGES=12   # how many messages of the room to show the classifier
+PI_CHAT_GATE_CONTEXT_CHARS=1500    # and the character budget that caps it
 ```
 
 The keep-alive exists because of a measurement, not a hunch. On the shipped endpoint, a room decision
@@ -126,6 +128,21 @@ changed the behaviour people were already relying on. `PI_CHAT_REPLY_GATE_MODE=e
 `PI_CHAT_GATE_ROOM_ROOT=dry-run` is the shape that measures a room while every flow that already gates
 keeps gating. `TestRoomDryRunDoesNotDowngradeFlowsThatAlreadyGate` is the test for that.
 An untagged group thread is eligible only if it already contains an @pi-chat mention.
+
+When `PI_CHAT_USER_LISTENER=on` and the OAuth credential is mounted, every room decision is made with the
+conversation in front of it: the bridge reads a bounded window of the space (newest-first from the API,
+rendered oldest-first, the thread root included even when it is days older than the message) and hands
+the same window to the classifier and to Pi. One read serves three questions - what was said, who said it,
+and whether pi-chat has spoken in this thread - because that read measured 1.6s against a ~300ms model
+call, and three of them would be slower than the answer. `TestConversation_OwnershipComesFromTheWindow`
+asserts the single read.
+
+Measured on 2026-11-26 (`eval/chat-gate/eval-context.mjs`, 10 cases x 3 repeats): showing the window
+costs no verdict - every case answered the same with and without it - and no case flipped NO to YES.
+The room prompt routes "correcting what pi-chat said" through `{summary}` rather than through the block,
+and seeding `{summary}` from the window did not move it either. The window ships for what it does fix:
+the 403 ownership read that was dropping messages unseen, identity for people who have never tagged the
+app, and Pi answering a mention without having been shown the thread it was asked about.
 If the classifier cannot decide - transport failure, timeout after every attempt, or an answer that is
 not an exact token - a 1:1 message still gets the default inline route (it is addressed by construction)
 and a shared-thread message is left unanswered. A mention never reaches the gate, so tagging is always
