@@ -241,3 +241,37 @@ memory: `room-respond` **36/37 correct (97.3%), mean 200ms** - `for-bot 12/12`, 
 `hard 9/9`. **Zero false suppression** on content-bearing requests. The single miss `rr-20` is the
 opposite failure: the gate answers human-to-human chatter about pi-chat that nobody invited it into.
 That asymmetry is the thing dry-run traffic now has to confirm or clear.
+
+## The conversation window: what it bought, and what it did not (2026-11-26)
+
+`eval-context.mjs` asks every case twice - once as the bare line the gate used to judge, once with the
+window the bridge now composes above the template - three times each, and compares. Run it with
+`EVAL_REPEATS=3 node eval/chat-gate/eval-context.mjs`.
+
+Measured, `unsloth/gemma-4-E4B-it-GGUF:IQ4_XS`, temperature 0, 10 cases:
+
+- **The window costs nothing.** Every verdict with a window matched the verdict without one: 0
+  regressions, 0 wrong verdicts. That is the property the deploy depends on, because the vendored
+  prompts and their 97.3% number were measured on bare lines.
+- **No case flipped NO bare -> YES with context.** Two were designed to test exactly that (`cx-01`
+  "did you get the numbers right there" following a volume figure pi-chat reported; `cx-02`
+  "still no non-mentions then i guess huh", Ed's 04:04 message). Both stay NO 0/10 with the window.
+  The `room-respond` YES rule about correcting what pi-chat said reads `{summary}` and says "shown
+  below"; seeding `{summary}` from the window measured 0/5 YES on `cx-01` as well. Context alone will
+  not move this classifier, and pretending otherwise would be a label change, not a result.
+- **One prompt edit was measured and rejected.** Adding a YES bullet for "complains about what pi-chat
+  said in the conversation above" made `cx-02` YES 5/5 - and made `cx-10` ("why does it do that", the
+  room talking *about* the bot to a person) YES 5/5 too. Trading a quiet meta-complaint for
+  self-referential chatter is the wrong direction, so `cx-10` is now a permanent keep-no guard.
+- **Ed's 03:25 message was never a classifier failure.** "so what's the scoop mr. bot, are you working
+  today or not?" judges YES 5/5 bare *and* 5/5 with context. It went unanswered because the ownership
+  read behind it returned 403 and `groupMessageEligible` dropped the message before any call. That is
+  why the fix is in ingestion, and why `cx-09` pins the verdict.
+- **Verdicts are reproducible in a run, not always across runs.** With 3-5 back-to-back identical calls
+  a case is unanimous, but `cx-01` bare has been observed NO on one process and YES on another (0/10
+  on a dedicated probe). Treat a single live dry-run NO as weak evidence on borderline phrasing.
+
+The window still ships, for three reasons the gate verdict is not one of them: it is what the *thread
+ownership* decision now reads (the 403 path is gone), it is what identity resolution reads, and it is
+what Pi receives on a mention - pi-chat answering "still no non-mentions" without ever being shown the
+2026-11-23 thread root it was being asked about is a worse failure than staying quiet.

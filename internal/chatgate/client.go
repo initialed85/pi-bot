@@ -282,10 +282,16 @@ func prompt(req Request) (string, error) {
 	// reliably guided by; burying it under a transcript is how a one-word classifier starts writing
 	// paragraphs. The template text itself is vendored from the eval and stays byte-identical, so
 	// adding context here does not silently invalidate the measured prompt.
-	return "Conversation in this room so far, oldest first, in [time] who: what form. " +
-		"It is context for judging the message below, not itself a message to answer.\n" +
-		strings.TrimRight(req.Transcript, "\n") + "\n\n" + composed, nil
+	return TranscriptPreamble + "\n" + strings.TrimRight(req.Transcript, "\n") + "\n\n" + composed, nil
 }
+
+// TranscriptPreamble is the one sentence that tells the classifier the block below it is context and
+// not another message to answer. It is exported, and mirrored in eval/chat-gate/
+// transcript-scaffolding.txt, because the eval has to compose prompts the same way the bridge does to
+// measure what the bridge will actually send: a second copy of this sentence in the eval script is a
+// second truth, and a drift test would not see it.
+const TranscriptPreamble = "Conversation in this room so far, oldest first, in [time] who: what form. " +
+	"It is context for judging the message below, not itself a message to answer."
 
 func first(value, fallback string) string {
 	if value == "" {
