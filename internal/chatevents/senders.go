@@ -15,9 +15,14 @@
 //
 // What does work is the read the bridge already uses for history review, under the same credential:
 //
-//	GET chat.googleapis.com/v1/spaces/<space>/messages?pageSize=25&fields=messages/name,messages/sender
+//	GET chat.googleapis.com/v1/spaces/<space>/messages?pageSize=25&orderBy=createTime desc&fields=messages/name,messages/sender
 //		200, and each sender carries name AND email AND displayName together, e.g.
 //		{"name":"users/113070394191408311024","email":"initialed85@gmail.com","displayName":"initialed85 _","type":"HUMAN"}
+//
+// `orderBy=createTime desc` is load-bearing and was not there originally. Measured 2026-11-26: the API
+// answers ascending, so a 25-message read of a space created in 2013 returns 2013 - the lookup was
+// comparing a room member's id against the oldest messages in the room and could only ever miss. The
+// deployed symptom is that every room sender resolved `via=seed` and none ever `via=lookup`.
 //
 // So identity is resolved by looking at recent messages *in the space the message landed in* and taking
 // the email that Chat itself published next to that user id, then caching it. The scope is no wider than
@@ -125,7 +130,7 @@ func (s *SenderLookup) Resolve(ctx context.Context, space, userID string) (Sende
 		return SenderIdentity{}, false, err
 	}
 
-	url := fmt.Sprintf("%s/%s/messages?pageSize=%d&fields=%s",
+	url := fmt.Sprintf("%s/%s/messages?pageSize=%d&orderBy=createTime%%20desc&fields=%s",
 		strings.TrimRight(s.ChatEndpoint, "/"), strings.TrimPrefix(space, "/"), s.PageSize, messagesFields)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {

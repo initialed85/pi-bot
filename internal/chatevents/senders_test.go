@@ -74,6 +74,11 @@ func TestSenderLookup_ResolvesTheIDTheListenerShipsUsingTheHistoryChatGives(t *t
 		if got := r.URL.Query().Get("pageSize"); got == "" {
 			t.Errorf("pageSize missing")
 		}
+		// Ascending is the API default and it silently returns the wrong decade, so the pin here is a
+		// regression pin against a bug that was live in production, not a style preference.
+		if got := r.URL.Query().Get("orderBy"); got != "createTime desc" {
+			t.Errorf("orderBy = %q, want %q (ascending reads return the oldest messages of the space)", got, "createTime desc")
+		}
 		if got := r.Header.Get("authorization"); got != "Bearer fake-access-token" {
 			t.Errorf("authorization = %q", got)
 		}
