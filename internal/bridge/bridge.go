@@ -786,6 +786,10 @@ func (b *Bridge) onMessage(ctx context.Context, ev *chatmsg.Event) error {
 		}
 	}
 	prompt := ev.Prompt()
+	// The gate judges what the human typed, and sees the room only through `Transcript` - the exact shape
+	// eval/chat-gate/eval-context.mjs measured. Handing it the scaffolded prompt below would show the
+	// window twice: the same verdict for double the tokens, and a "Message" that is not anyone's message.
+	replyThread, suppress := b.replyGate(ctx, ev, prompt)
 	// Pi gets the same window the classifier judged on. A mention that lands three messages into a
 	// thread pi-chat has not seen is otherwise a question about a request the bridge has never read: the
 	// root of spaces/qi7VbgAAAAE/threads/3fbZOFDt3zI is from 2026-11-23 and asks for a fortnightly pay
@@ -794,7 +798,6 @@ func (b *Bridge) onMessage(ctx context.Context, ev *chatmsg.Event) error {
 		prompt = "Conversation in this room so far, oldest first, read from Google Chat just now. " +
 			"The new message to act on is quoted after it.\n" + ev.Conversation + "\nNew message: " + prompt
 	}
-	replyThread, suppress := b.replyGate(ctx, ev, prompt)
 	if suppress {
 		return nil
 	}

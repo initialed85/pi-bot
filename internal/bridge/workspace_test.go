@@ -204,6 +204,54 @@ func TestHandleWorkspace_RoomClassifierIsAskedInDryRun(t *testing.T) {
 	}
 }
 
+// TestHandleWorkspace_GateJudgesTheLineAndPiGetsTheScaffold is the prompt-hygiene split. The classifier
+// gets the human's own words in `Message` and the room only in `Transcript`; Pi gets the scaffolded
+// window. Before this the gate was handed the Pi prompt, so it read the room twice - visible in
+// production logs as a "Message" field containing "New message:" - and cost 2x tokens for one verdict.
+func TestHandleWorkspace_GateJudgesTheLineAndPiGetsTheScaffold(t *testing.T) {
+	conv := &fakeConversation{
+		people:     []Person{humanPerson("users/222", "initialed85@gmail.com")},
+		transcript: "[06:28] initialed85: the dryer is still going",
+	}
+	gate := &fakeGate{answers: map[string]string{chatgate.FlowRoomRespond: "YES"}, errs: map[string]error{}}
+	b, chat, gw := listenerBridge(Config{
+		RequireMentionInRooms: true,
+		GateRoomRootMode:      "enforce",
+		ReplyGateMode:         "enforce",
+		ReplyGate:             gate,
+		Conversation:          conv,
+	})
+	if err := b.HandleWorkspace(context.Background(), "psm-scaffold", listenerAttrs, listenerFixture(t, "workspace_room_untagged.json")); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	prompt := gw.lastPrompt()
+	gw.settle(prompt.ID, "the dryer finished at 05:40")
+	b.Wait()
+
+	calls := gate.callsFor(chatgate.FlowRoomRespond)
+	if len(calls) != 1 {
+		t.Fatalf("gate calls = %d, want 1: %+v", len(calls), gate.calls)
+	}
+	if calls[0].message != "the garage door has been open since this morning" {
+		t.Errorf("classifier judged something other than the human's line: %q", calls[0].message)
+	}
+	if strings.Contains(calls[0].message, "New message:") || strings.Contains(calls[0].message, "[") {
+		t.Errorf("the classifier was handed the scaffold, so it read the window twice: %q", calls[0].message)
+	}
+	if calls[0].transcript == "" {
+		t.Error("the classifier decided on a bare line with no conversation")
+	}
+	if !strings.Contains(prompt.Text, "New message:") || !strings.Contains(prompt.Text, "dryer is still going") {
+		t.Errorf("Pi did not get the window: %q", prompt.Text)
+	}
+	if text, _, ok := chat.lastPost(); !ok || !strings.Contains(text, "05:40") {
+		t.Errorf("room answer not posted: %q ok=%v", text, ok)
+	}
+	if asks := conv.askList(); len(asks) != 1 {
+		t.Fatalf("the window was read %d times for one message: %v", len(asks), asks)
+	}
+}
+
 // TestHandleWorkspace_RoomAnswerLandsInItsOwnThread is the enforce behaviour Ed's routing policy asks
 // for: an untagged room message that the classifier judges worth answering is answered in the thread
 // Chat created for it, not bolted onto the room root.
