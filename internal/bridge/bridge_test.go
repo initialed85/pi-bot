@@ -51,8 +51,10 @@ func (f *fakeChat) Post(_ context.Context, text string, opts chatapi.PostOpts) (
 	if opts.ClientID != "" {
 		for _, p := range f.posts {
 			if p.opts.ClientID == opts.ClientID && p.opts.Space == opts.Space {
-				// Chat refuses a duplicate custom id; mirror the 409 so tests can rely on it.
-				return nil, fmt.Errorf("chatapi: duplicate client id %s", opts.ClientID)
+				// Chat refuses a duplicate custom id; mirror the 409 so tests can rely on it, and mirror
+				// the wrapping too - callers distinguish "failed" from "already in the room" through
+				// chatapi.IsDuplicate.
+				return nil, fmt.Errorf("%w: client id %s", chatapi.ErrDuplicate, opts.ClientID)
 			}
 		}
 	}
@@ -1588,6 +1590,10 @@ func TestWithDefaultsCarriesEveryConfigField(t *testing.T) {
 		Conversation:          &fakeConversation{transcript: "[00:01] Owner: hello"},
 		GateContextMessages:   7,
 		GateContextChars:      800,
+		OutboundSpaces:        []string{"spaces/GRANTED"},
+		OutboundPerHour:       3,
+		OutboundMaxChars:      3000,
+		OutboundInterval:      40 * time.Millisecond,
 	}
 
 	out := in.withDefaults()

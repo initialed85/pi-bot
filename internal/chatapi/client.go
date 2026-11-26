@@ -12,6 +12,7 @@ package chatapi
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	chat "google.golang.org/api/chat/v1"
+	googleapi "google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 	apithttp "google.golang.org/api/transport/http"
 )
@@ -63,6 +65,24 @@ type Message struct {
 	Text string
 }
 
+// ErrDuplicate means Chat already holds a message with the custom id we sent, which is what a retry after
+// a lost ack looks like from the outside. It is worth its own error because "the post failed" and "the
+// post is already sitting in that room" are opposite facts, and a caller that confuses them will either
+// double-post or report a failure the human can see is not one.
+var ErrDuplicate = errors.New("chatapi: message with this client id already exists")
+
+// IsDuplicate reports whether a Post failure means the message is already there.
+func IsDuplicate(err error) bool {
+	if errors.Is(err, ErrDuplicate) {
+		return true
+	}
+	var gerr *googleapi.Error
+	if errors.As(err, &gerr) {
+		return gerr.Code == http.StatusConflict || strings.Contains(gerr.Message, "ALREADY_EXISTS")
+	}
+	return false
+}
+
 func (c *Client) Post(ctx context.Context, text string, opts PostOpts) (*Message, error) {
 	msg := &chat.Message{Text: text, MarkupSyntax: "MARKUP_SYNTAX_MARKDOWN"}
 	if opts.Thread != "" {
@@ -81,6 +101,9 @@ func (c *Client) Post(ctx context.Context, text string, opts PostOpts) (*Message
 	}
 	created, err := call.Context(ctx).Do()
 	if err != nil {
+		if IsDuplicate(err) {
+			return nil, fmt.Errorf("%w (%s): %v", ErrDuplicate, opts.Space, err)
+		}
 		return nil, fmt.Errorf("chatapi: post to %s: %w", opts.Space, err)
 	}
 	return &Message{Name: created.Name, Text: created.Text}, nil

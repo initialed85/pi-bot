@@ -24,6 +24,10 @@
 //   POST /v1/command       {name, args} -> run a slash command in this session
 //   GET  /v1/turns         recent turns (newest first)
 //   GET  /v1/turns/:id     one turn: status, streamed text, tool trail, final text
+//   POST /v1/outbound      {space, thread?, text, reason?} -> 202 {id}; holds an agent-initiated post for
+//                         the bridge to send (the bridge is the only writer to Chat)
+//   GET  /v1/outbox        bridge-only: claim everything queued (a claim lapses after 30s)
+//   POST /v1/outbox/:id/ack {ok, messageName?, error?, permanent?}
 //
 // The bridge polls /v1/turns/:id rather than holding an SSE stream. Polling survives a bridge
 // restart (the turn is still there), needs no reconnect/resync logic, and Chat's own rate limits
@@ -31,6 +35,7 @@
 
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const VERSION = "0.1.0";
@@ -112,6 +117,37 @@ const MARKER = /\[pi-chat:([A-Za-z0-9_-]{3,40})\]/g;
  */
 const TURN_TOKEN = /\u27e6pi-chat ([0-9a-fA-F]{4,40})\u27e7/g;
 
+/** Space names Chat hands out: `spaces/AAAA…`, optionally with `/threads/AAAA…` on the end. */
+const SPACE_NAME = /^spaces\/[A-Za-z0-9_-]{3,64}(\/threads\/[A-Za-z0-9_-]{3,64})?$/;
+
+/** Outbound (agent-initiated) posts: how many the gateway will hold, how long a bridge claim stands,
+ *  and how many times one post is retried before it is called a failure. */
+const OUTBOUND_CAP = 50;
+const OUTBOUND_CLAIM_MS = 30_000;
+const OUTBOUND_ATTEMPTS = 5;
+const OUTBOUND_MAX_CHARS = 4000;
+
+/**
+ * A message Pi asked to post into Chat with nothing prompting it - a schedule firing, an auto-resume
+ * after a pod restart, a peer hand-off. It lives here, in the session's own memory, rather than on a
+ * second authenticated surface on the bridge: the bridge holds the Chat credential and is already the
+ * only writer, so it drains this list on a short timer. The bridge refuses anything whose space is not
+ * in PI_CHAT_OUTBOUND_SPACES, which is the real gate.
+ */
+interface Outbound {
+  id: string;
+  space: string;
+  thread?: string;
+  text: string;
+  reason?: string;
+  at: number;
+  attempts: number;
+  status: "queued" | "delivered" | "failed";
+  error?: string;
+  messageName?: string;
+  claimedAt?: number;
+}
+
 /** Per-message reminder of the bridge's forwarding rule, appended after the user's text. */
 const CHAT_RULE = "[chat bridge: only your final text block is posted back to Chat - intermediates are dropped. End with a self-contained answer.]";
 
@@ -163,6 +199,83 @@ export default function activate(pi: ExtensionAPI) {
       turn.settledAt = Date.now();
     }
     note(turn);
+  }
+
+  // ---------------------------------------------------------------- outbound (agent-initiated posts)
+
+  const outbox: Outbound[] = [];
+
+  /** queueOutbound takes a post from the tool or the HTTP surface and holds it for the bridge to send. */
+  function queueOutbound(input: { space?: string; thread?: string; text?: string; reason?: string }): { ok: true; entry: Outbound } | { ok: false; error: string } {
+    const text = typeof input.text === "string" ? input.text.trim() : "";
+    if (!text) return { ok: false, error: "text is required" };
+    if (text.length > OUTBOUND_MAX_CHARS) return { ok: false, error: `text is ${text.length} characters, over the ${OUTBOUND_MAX_CHARS} limit` };
+    const space = typeof input.space === "string" ? input.space.trim() : "";
+    if (!SPACE_NAME.test(space)) return { ok: false, error: `space must look like "spaces/…" (got ${JSON.stringify(space)})` };
+    const entry: Outbound = {
+      id: randomUUID().slice(0, 16),
+      space,
+      text,
+      reason: typeof input.reason === "string" ? input.reason.slice(0, 60) : undefined,
+      at: Date.now(),
+      attempts: 0,
+      status: "queued",
+    };
+    const thread = typeof input.thread === "string" ? input.thread.trim() : "";
+    if (thread) {
+      if (!SPACE_NAME.test(thread)) return { ok: false, error: `thread must look like "spaces/…/threads/…" (got ${JSON.stringify(thread)})` };
+      entry.thread = thread;
+    }
+    outbox.push(entry);
+    while (outbox.length > OUTBOUND_CAP) outbox.shift();
+    return { ok: true, entry };
+  }
+
+  /** takeOutbox hands the bridge everything due: queued, or claimed long enough ago that the claim lapsed. */
+  function takeOutbox(): Outbound[] {
+    const now = Date.now();
+    const due = outbox.filter((o) => o.status === "queued" && (!o.claimedAt || now - o.claimedAt > OUTBOUND_CLAIM_MS));
+    for (const o of due) {
+      o.claimedAt = now;
+      o.attempts += 1;
+    }
+    return due;
+  }
+
+  function ackOutbound(id: string, ok: boolean, messageName?: string, error?: string, permanent?: boolean): Outbound | undefined {
+    const entry = outbox.find((o) => o.id === id);
+    if (!entry) return undefined;
+    if (ok) {
+      entry.status = "delivered";
+      entry.messageName = messageName;
+      entry.error = undefined;
+    } else if (permanent || entry.attempts >= OUTBOUND_ATTEMPTS) {
+      // The bridge calls a post into a space nobody granted permanent: retrying it five times would
+      // produce five log lines and the same refusal, and would tell the agent nothing new.
+      entry.status = "failed";
+      entry.error = error;
+    } else {
+      // Back to queued with no claim, so the next drain retries it. Permanent refusals are avoided by
+      // the bridge acking them as a failure it means; it says so in `error` and the tool result carries it.
+      entry.status = "queued";
+      entry.claimedAt = undefined;
+      entry.error = error;
+    }
+    return entry;
+  }
+
+  /**
+   * Where a post goes when the caller did not say: the space of the most recent Chat message this session
+   * has seen, at its root. That is Ed's rule - "when setting a schedule, we need to convey the chat or
+   * thread to respond in (assume root of this chat if unset)" - and the same default serves an auto-resume
+   * or a peer wake, because in all three cases "this chat" is the conversation already in progress.
+   */
+  function latestChatSpace(): { space?: string } {
+    for (let i = order.length - 1; i >= 0; i--) {
+      const input = turns.get(order[i])?.inputs[0];
+      if (input?.source === "chat" && input.space && SPACE_NAME.test(input.space)) return { space: input.space };
+    }
+    return {};
   }
 
   function textOf(message: any): string {
@@ -512,6 +625,7 @@ export default function activate(pi: ExtensionAPI) {
         thinkingLevel: ctx?.thinkingLevel,
         activeTurn: active?.id,
         turns: order.length,
+        outbox: outbox.filter((o) => o.status === "queued").length,
         commands: pi.getCommands().length,
         contextUsage: ctx?.getContextUsage ? safe(() => ctx.getContextUsage()) : undefined,
       });
@@ -648,6 +762,36 @@ export default function activate(pi: ExtensionAPI) {
       return;
     }
 
+    if (method === "POST" && url === "/v1/outbound") {
+      const body = await readBody(request);
+      const result = queueOutbound(body);
+      if (!result.ok) {
+        sendJson(response, 400, { error: result.error });
+        return;
+      }
+      sendJson(response, 202, { ok: true, id: result.entry.id, status: result.entry.status, space: result.entry.space });
+      return;
+    }
+
+    if (method === "GET" && url === "/v1/outbox") {
+      // The bridge is the only reader; the claim is recorded here so a bridge that dies mid-post cannot
+      // take the same entry again until the claim lapses.
+      sendJson(response, 200, { items: takeOutbox() });
+      return;
+    }
+
+    if (method === "POST" && url.startsWith("/v1/outbox/")) {
+      const body = await readBody(request);
+      const id = decodeURIComponent(url.slice("/v1/outbox/".length).replace(/\/ack$/, ""));
+      const entry = ackOutbound(id, body.ok === true, typeof body.messageName === "string" ? body.messageName : undefined, typeof body.error === "string" ? body.error : undefined, body.permanent === true);
+      if (!entry) {
+        sendJson(response, 404, { error: "unknown outbound id", id });
+        return;
+      }
+      sendJson(response, 200, { ok: true, id: entry.id, status: entry.status, error: entry.error });
+      return;
+    }
+
     sendJson(response, 404, { error: "not found", url });
   }
 
@@ -687,6 +831,80 @@ export default function activate(pi: ExtensionAPI) {
       }
       ctx.abort();
       ctx.ui.notify("pi-chat-gateway: aborted", "info");
+    },
+  });
+
+  /**
+   * The tool that makes pi-chat able to speak first. Nothing about it bypasses the bridge: the post is
+   * queued here and the bridge sends it under its own Chat credential, which is where the allowlist,
+   * the length cap, the per-hour cap, the turn marker and the idempotent client id all live. So this is
+   * not a second path to Chat - it is the same path, entered from the other end.
+   */
+  pi.registerTool({
+    name: "chat_post",
+    label: "Chat post",
+    description:
+      "Post a message into Google Chat that is not the answer to a Chat message - a scheduled prompt firing, an auto-resume after a pod restart, or a task handed over by another agent. The bridge only sends posts whose space is in its PI_CHAT_OUTBOUND_SPACES allowlist, and it refuses the rest.",
+    promptSnippet: "Post into a Chat space or thread without a Chat message prompting it",
+    promptGuidelines: [
+      "Use chat_post when a scheduled prompt, an auto-resume after a restart, or a peer message asks you to tell someone something in Chat rather than answer them here.",
+      "chat_post defaults to the root of the chat the last message came from; pass space or thread when the target is a different conversation, and pass thread when it must land inside one.",
+      "Do not use chat_post to narrate progress or to report what you are about to do; post the thing a person needed to hear, once.",
+      "A chat_post result saying 'queued' means it is NOT in Chat yet - if it matters that it landed, say so rather than claiming it posted.",
+    ],
+    parameters: Type.Object({
+      text: Type.String({ description: "Markdown text to post. Keep it self-contained: a person reading it cold in a room has no idea you asked this question." }),
+      space: Type.Optional(Type.String({ description: `Target space, "spaces/…". Defaults to the chat this session is already in.` })),
+      thread: Type.Optional(Type.String({ description: `"spaces/…/threads/…". Omit to post at the space root.` })),
+      reason: Type.Optional(Type.String({ description: "Why this is being posted unprompted: schedule, resume, peer, or manual. Logged, not shown to anyone." })),
+    }),
+
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      ctxRef = ctx;
+      const target = (params.space || "").trim() || latestChatSpace().space || "";
+      if (!target) {
+        return {
+          content: [{ type: "text", text: 'chat_post needs a space: none was given and this session has not handled a Chat message yet, so there is no "this chat" to default to. Pass space: "spaces/…".' }],
+          details: { ok: false },
+        };
+      }
+      const queued = queueOutbound({ space: target, thread: params.thread, text: params.text, reason: params.reason });
+      if (!queued.ok) {
+        return { content: [{ type: "text", text: `chat_post refused before queueing: ${queued.error}` }], details: { ok: false } };
+      }
+      const entry = queued.entry;
+      // Wait a little for the bridge's ack, so the tool reports a delivery rather than an intention. The
+      // bridge drains on its own timer; if it is restarting, this returns queued and that is the truth.
+      const deadline = Date.now() + 6000;
+      while (entry.status === "queued" && Date.now() < deadline) {
+        if (signal?.aborted) break;
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
+      const where = entry.thread ? `thread ${entry.thread}` : `root of ${entry.space}`;
+      if (entry.status === "delivered") {
+        return { content: [{ type: "text", text: `Posted to the ${where}. Chat message: ${entry.messageName || "(name not returned)"}` }], details: { ok: true, id: entry.id, messageName: entry.messageName } };
+      }
+      if (entry.status === "failed") {
+        return { content: [{ type: "text", text: `The bridge will not post this (${where}): ${entry.error || "it gave up after " + entry.attempts + " attempts"}` }], details: { ok: false, id: entry.id } };
+      }
+      return {
+        content: [{ type: "text", text: `Queued for the ${where} (id ${entry.id}) - the bridge has not confirmed the post yet. If it matters that it landed, check later or say it is queued.` }],
+        details: { ok: true, queued: true, id: entry.id },
+      };
+    },
+  });
+
+  // The person in the pane gets to see what the agent has been saying on their behalf.
+  pi.registerCommand("chat-outbox", {
+    description: "Show agent-initiated Chat posts queued or sent since this session started",
+    handler: async (_args, ctx) => {
+      ctxRef = ctx;
+      if (!outbox.length) {
+        ctx.ui.notify("pi-chat-gateway: nothing outbound this session", "info");
+        return;
+      }
+      const lines = outbox.slice(-10).map((o) => `${o.id} ${o.status}${o.error ? ` (${o.error.slice(0, 50)})` : ""} ${o.space} ${o.text.replace(/\s+/g, " ").slice(0, 50)}`);
+      ctx.ui.notify(`pi-chat-gateway outbound (${outbox.length}):\n${lines.join("\n")}`, "info");
     },
   });
 }

@@ -49,6 +49,14 @@
 //	PI_CHAT_USER_OAUTH_SECRET_FILE  file holding the client secret when the client id arrived on its own (default /etc/pi-chat-user-oauth/client_secret)
 //	PI_CHAT_USER_OAUTH_TOKEN_FILE   file holding the refresh token, bare or {"refresh_token": …} (default /etc/pi-chat-user-oauth/refresh_token)
 //	PI_CHAT_ROOM_IDENTITY_SEED comma separated "users/<id>=someone@example.com" bindings that survive a redeploy (default empty). Not a secret: a Chat user id is not a credential, and the email is already in PI_CHAT_ALLOWLIST.
+//	PI_CHAT_OUTBOUND_SPACES     comma-separated space names ("spaces/AAA…") pi-chat may post into WITHOUT a
+//	                            message prompting it - schedule wakes, auto-resume after a restart, peer
+//	                            hand-offs. Empty (default) refuses all of them; "*" allows every space the
+//	                            bot is in, which is a decision to make on purpose, not by copy-paste.
+//	PI_CHAT_OUTBOUND_PER_HOUR   cap on agent-initiated posts per hour across all spaces (default 12; -1
+//	                            removes it). The cap is about a confused agent, not about Chat quotas.
+//	PI_CHAT_OUTBOUND_MAX_CHARS  longest single agent-initiated post (default 4000)
+//	PI_CHAT_OUTBOUND_POLL_MS    how often the bridge drains the gateway outbox (default 1500, floor 200)
 //	PI_CHAT_LOG_LEVEL          debug|info|warn|error (default info)
 package main
 
@@ -459,6 +467,26 @@ func loadSettings() (settings, error) {
 	}
 	if v := ints("PI_CHAT_GATE_CONTEXT_CHARS"); v > 0 {
 		s.cfg.GateContextChars = v
+	}
+
+	// Agent-initiated posting is granted per space, and the grant is deliberately separate from the reply
+	// gate: being allowed to answer in a room is not being allowed to speak first in one. Empty denies all,
+	// which is why the deployment has to name spaces explicitly for a schedule or an auto-resume to reach
+	// anybody.
+	s.cfg.OutboundSpaces = splitList(os.Getenv("PI_CHAT_OUTBOUND_SPACES"))
+	// Parsed rather than read through ints(), because -1 is a meaningful value here: it says "post as much
+	// as the space grant allows". A helper that treats unset and negative the same would quietly turn an
+	// operator's removal of the cap back into the default cap of 12.
+	if raw := strings.TrimSpace(os.Getenv("PI_CHAT_OUTBOUND_PER_HOUR")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			s.cfg.OutboundPerHour = n
+		}
+	}
+	if v := ints("PI_CHAT_OUTBOUND_MAX_CHARS"); v > 0 {
+		s.cfg.OutboundMaxChars = v
+	}
+	if v := ints("PI_CHAT_OUTBOUND_POLL_MS"); v >= 200 {
+		s.cfg.OutboundInterval = time.Duration(v) * time.Millisecond
 	}
 
 	// The room listener is a separate capability from the app path, and it is off by default: it reads

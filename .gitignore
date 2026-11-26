@@ -6,3 +6,6 @@ ___secret/
 spike/events.jsonl
 /tmp/
 /node_modules/
+# bridge evidence belongs on the journal volume, never in the repo
+gate-decisions.jsonl
+gate-decisions.jsonl.1

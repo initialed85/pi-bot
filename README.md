@@ -221,6 +221,50 @@ would have decided. It cannot post: its Chat implementation returns errors for P
 and its gateway refuses to ask Pi. It reads with the same user OAuth credential that authorises the
 subscription, and it acknowledges what it reviews, so run it deliberately.
 
+## Speaking first (agent-initiated posts)
+
+Everything above is reactive: a message arrives, pi-chat answers it. Three situations need the opposite,
+and none of them have a Chat message to hang a reply on:
+
+- **auto-resume after a pod restart** - somebody's work was interrupted mid-answer and the session woke
+  up with an owed turn it can now finish;
+- **a scheduled wake-up** - a `schedule_jobs` prompt fires and the thing it has to say belongs in a room,
+  not in the pane;
+- **a peer hand-off** - `pi-team-room` draws this session into action and the person who asked is reading
+  Google Chat, not the tmux.
+
+So Pi has a `chat_post` tool. It does not talk to Google: it queues the text in the session's own gateway,
+and the bridge - the only holder of the Chat credential, the only writer - drains that queue on a short
+timer. There is no second path to Chat to keep honest, which is why the outbound request enters through
+the gateway and leaves through the bridge.
+
+```bash
+PI_CHAT_OUTBOUND_SPACES=           # comma separated "spaces/AAA…" pi-chat may post into unprompted (default: none)
+PI_CHAT_OUTBOUND_PER_HOUR=12       # cap across all spaces; -1 removes it
+PI_CHAT_OUTBOUND_MAX_CHARS=4000    # per post, well under Chat's own 32k
+PI_CHAT_OUTBOUND_POLL_MS=1500      # how often the bridge drains the outbox
+```
+
+The grant is per space and deliberately separate from the reply gate: being allowed to answer in a room
+is not being allowed to speak first in one. With `PI_CHAT_OUTBOUND_SPACES` empty the drain loop never
+starts, every request is refused, and a bridge deployed without the grant is provably incapable of
+initiating a post. An ungranted space is acked as a *permanent* failure, so it does not quietly retry five
+times; a Chat API error is transient and does.
+
+What the bridge does to each post before Chat sees it:
+
+1. length check, then the sliding one-hour window;
+2. a deterministic `ClientID` from the outbox entry id, so a post whose ack was lost - the usual outcome
+   when a rollout lands between "sent" and "recorded" - is refused by Chat as a duplicate instead of
+   appearing twice in front of people;
+3. a `⟦pi-chat <id>⟧` turn marker at the start, which makes the notice quotable: reply to it and the
+   bridge resolves which question it was about rather than guessing from an empty thread. Only our own
+   words are filed for that recall, and it is filed in the in-memory ring, never as an owed turn - a post
+   nobody asked for must not come back as a recovery prompt after a restart.
+
+The tool reports `delivered` only when the bridge's ack says Chat took it; otherwise it says `queued`,
+which is the difference between a message that exists and an intention.
+
 ## Layout
 
 ```

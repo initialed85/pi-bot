@@ -235,6 +235,53 @@ func (c *Client) Commands(ctx context.Context) ([]Command, error) {
 	return out.Commands, err
 }
 
+// Outbound is a message Pi asked the bridge to post into Chat on its own initiative - not the answer
+// to a Chat message. It lives in the gateway's outbox because the gateway is the only thing Pi can
+// write to without opening a second authenticated surface on the bridge, and the bridge is the only
+// thing holding the Chat credential. One hop each way, same direction as every other call.
+type Outbound struct {
+	ID       string `json:"id"`
+	Space    string `json:"space"`
+	Thread   string `json:"thread,omitempty"`
+	Text     string `json:"text"`
+	Reason   string `json:"reason,omitempty"`
+	At       int64  `json:"at"`
+	Attempts int    `json:"attempts"`
+	Status   string `json:"status"`
+}
+
+// OutboxClaim is what the bridge takes from the outbox: the entries plus their claim, so a drain that
+// dies mid-post leaves a claim that expires rather than a message nobody will ever send again.
+type OutboxClaim struct {
+	Items []Outbound `json:"items"`
+}
+
+// Outbox asks the gateway for outbound posts that are due. Claimed-but-unacked entries reappear once
+// the gateway's claim window lapses.
+func (c *Client) Outbox(ctx context.Context) ([]Outbound, error) {
+	var out OutboxClaim
+	if err := c.do(ctx, http.MethodGet, "/v1/outbox", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Items, nil
+}
+
+// OutboxAck is what the bridge tells the gateway about one attempt. Permanent matters because a refusal
+// the gateway could retry until the stars burn out (a space nobody granted) is different in kind from a
+// Chat API that is having a bad minute, and only the second one deserves five attempts.
+type OutboxAck struct {
+	OK        bool   `json:"ok"`
+	Message   string `json:"messageName,omitempty"`
+	Failure   string `json:"error,omitempty"`
+	Permanent bool   `json:"permanent,omitempty"`
+}
+
+// AckOutbox tells the gateway what happened to one outbound post. Delivered entries leave the outbox;
+// transient failures go back to queued, permanent ones are settled immediately.
+func (c *Client) AckOutbox(ctx context.Context, id string, ack OutboxAck) error {
+	return c.do(ctx, http.MethodPost, "/v1/outbox/"+id+"/ack", ack, nil)
+}
+
 // Health is the one unauthenticated endpoint; used for readiness.
 func (c *Client) Health(ctx context.Context) error {
 	var out struct {

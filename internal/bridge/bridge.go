@@ -163,6 +163,21 @@ type Config struct {
 	// session and Pi needs to know whose request it is honouring.
 	PrefixWithSender bool
 
+	// OutboundSpaces lists the space names pi-chat may post into on its own initiative - a schedule firing,
+	// an auto-resume after a pod restart, a peer drawing the session into action. Empty means the feature
+	// is off: the drain loop never starts and every request is refused, because speaking first in somebody
+	// else's room is the kind of permission that gets granted by name, not by default. "*" allows every
+	// space the bot has been added to.
+	OutboundSpaces []string
+	// OutboundPerHour caps agent-initiated posts per hour across all spaces (0 uses the default; a
+	// negative value removes the cap). OutboundMaxChars bounds one post well under Chat's 32,000 so a
+	// scheduled notice cannot arrive as a wall of text.
+	OutboundPerHour  int
+	OutboundMaxChars int
+	// OutboundInterval is how often the bridge checks the gateway's outbox. It is short because the
+	// alternative is a message that sat queued for five minutes behind the classifier keep-warm.
+	OutboundInterval time.Duration
+
 	// ReplyGateMode is off, dry-run, or enforce. The application and library default to off so a
 	// dev-only classifier never becomes an unexpected production dependency.
 	ReplyGateMode     string
@@ -227,6 +242,9 @@ func DefaultConfig() Config {
 		GateKeepAlive:         5 * time.Minute,
 		GateContextMessages:   12,
 		GateContextChars:      1500,
+		OutboundPerHour:       12,
+		OutboundMaxChars:      4000,
+		OutboundInterval:      1500 * time.Millisecond,
 	}
 }
 
@@ -309,6 +327,19 @@ func (c Config) withDefaults() Config {
 	if d.GateContextChars <= 0 {
 		d.GateContextChars = DefaultConfig().GateContextChars
 	}
+	d.OutboundSpaces = c.OutboundSpaces
+	d.OutboundPerHour = c.OutboundPerHour
+	if d.OutboundPerHour == 0 {
+		d.OutboundPerHour = DefaultConfig().OutboundPerHour
+	}
+	d.OutboundMaxChars = c.OutboundMaxChars
+	if d.OutboundMaxChars <= 0 {
+		d.OutboundMaxChars = DefaultConfig().OutboundMaxChars
+	}
+	d.OutboundInterval = c.OutboundInterval
+	if d.OutboundInterval <= 0 {
+		d.OutboundInterval = DefaultConfig().OutboundInterval
+	}
 	d.IdentitySeed = c.IdentitySeed
 	// A bool has no sentinel to test against, so it is copied rather than defaulted: leaving it out
 	// silently drops the operator's setting.
@@ -369,6 +400,10 @@ type Bridge struct {
 	journal     *journal
 	watchCtx    context.Context
 	watchCancel context.CancelFunc
+	// outboundRate is the rolling hour of agent-initiated posts. It is per process on purpose: the cap
+	// exists to stop one confused agent narrating a room, and a shared cap across pods would need state
+	// this bridge does not have.
+	outboundRate *outboundWindow
 }
 
 type watch struct {
@@ -416,19 +451,20 @@ func New(chat Chat, gw Gateway, cfg Config, log *slog.Logger) *Bridge {
 			WithSchedule(resolved.ReplyGateAttempts...)
 	}
 	b := &Bridge{
-		chat:        chat,
-		gw:          gw,
-		cfg:         resolved,
-		log:         log,
-		seen:        map[string]struct{}{},
-		watches:     map[string]*watch{},
-		delivered:   map[string]bool{},
-		summaries:   map[string]string{},
-		roomAnswers: map[string]string{},
-		piThreads:   map[string]struct{}{},
-		gate:        gate,
-		conv:        resolved.Conversation,
-		journal:     openJournal(resolved.JournalFile, log),
+		chat:         chat,
+		gw:           gw,
+		cfg:          resolved,
+		log:          log,
+		seen:         map[string]struct{}{},
+		watches:      map[string]*watch{},
+		delivered:    map[string]bool{},
+		summaries:    map[string]string{},
+		roomAnswers:  map[string]string{},
+		piThreads:    map[string]struct{}{},
+		gate:         gate,
+		conv:         resolved.Conversation,
+		journal:      openJournal(resolved.JournalFile, log),
+		outboundRate: &outboundWindow{},
 	}
 	// Watches outlive the message that created them on purpose: a rollout must keep the chance to answer
 	// the question it interrupted. Drain is what cancels this, after giving them their window.
@@ -472,6 +508,11 @@ func New(chat Chat, gw Gateway, cfg Config, log *slog.Logger) *Bridge {
 				log.Info("reply gate kept warm", "every", keepAlive)
 			}
 		}()
+	}
+	// Agent-initiated posting is off unless spaces were named. The loop rides watchCtx so a rollout
+	// drains what it can inside the finish window instead of abandoning a queued notice.
+	if len(resolved.OutboundSpaces) > 0 {
+		b.startOutbound(b.watchCtx)
 	}
 	return b
 }

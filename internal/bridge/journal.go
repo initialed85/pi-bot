@@ -152,6 +152,21 @@ func (j *journal) update(promptID string, fn func(*pendingTurn)) {
 	}
 }
 
+// remember files a turn in the answered ring without ever making it a debt. Agent-initiated outbound
+// posts use it: nothing was owed, but a person quoting the notice back should still resolve to what it
+// was about rather than being told the id is unknown.
+func (j *journal) remember(p *pendingTurn) {
+	if j == nil || p == nil || p.PromptID == "" {
+		return
+	}
+	j.mu.Lock()
+	j.answered = append(j.answered, p)
+	if len(j.answered) > maxAnsweredRing {
+		j.answered = j.answered[len(j.answered)-maxAnsweredRing:]
+	}
+	j.mu.Unlock()
+}
+
 // drop marks an answer delivered (or unowable). Missing keys are fine.
 func (j *journal) drop(promptID string) {
 	if j == nil || promptID == "" {

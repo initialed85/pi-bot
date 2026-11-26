@@ -139,3 +139,20 @@ func TestReplyGateWritesItsEvidenceOnTheWayThrough(t *testing.T) {
 		t.Errorf("a decision with no prompt id cannot be tied back to the message: %+v", last)
 	}
 }
+
+// The guard this exists for: a bridge with no journal path has no volume, and until recordDecision said
+// so, every test run wrote a gate-decisions.jsonl into the package directory and one eventually got
+// committed as though it were evidence from a real pod.
+func TestDecisionsDoNotLandInTheWorkingDirectory(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	j := openJournal("", quietLogger())
+	j.recordDecision(gateDecision{Flow: chatgate.FlowShouldRespond, Action: "forward", Mode: "enforce"})
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("a journal with no path wrote %d file(s) into the working directory: %v", len(entries), entries)
+	}
+}

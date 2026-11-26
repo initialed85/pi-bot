@@ -50,6 +50,12 @@ func (j *journal) recordDecision(d gateDecision) {
 	if j == nil {
 		return
 	}
+	// No journal path means no volume, and "somewhere convenient" is the directory the process happened
+	// to start in. Every bridge test runs that way, and before this guard each run left a
+	// gate-decisions.jsonl inside internal/bridge/ - which then got committed as though it were evidence.
+	if j.path == "" {
+		return
+	}
 	if d.TS.IsZero() {
 		d.TS = time.Now().UTC()
 	}
