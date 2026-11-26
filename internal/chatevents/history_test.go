@@ -274,3 +274,34 @@ func TestHistory_TranscriptIsBoundedAndKeepsTheNewest(t *testing.T) {
 		t.Fatalf("transcript dropped the newest message: %q", tr[len(tr)-200:])
 	}
 }
+
+// TestTranscriptDropsBridgeTurnMarkers keeps the window honest about what a model may read. Bridge
+// notices carry a ⟦pi-chat <id>⟧ marker so a person can point at one, and every one of those notices
+// comes back through this window on the next message - so the marker is removed here, which is the one
+// place both the classifier transcript and Pi's prompt are built.
+func TestTranscriptDropsBridgeTurnMarkers(t *testing.T) {
+	now := time.Now()
+	c := Context{Messages: []Message{
+		{
+			Text:        "⟦pi-chat cd8996c5⟧ ⚠️ The bridge is restarting while that was running.",
+			Bot:         true,
+			DisplayName: "pi-chat",
+			CreateTime:  now.Add(-time.Minute),
+		},
+		{
+			Text:        "which one was that? (id 42 is not a marker)",
+			DisplayName: "Ed",
+			CreateTime:  now,
+		},
+	}}
+	tr := c.Transcript(20, 1200)
+	if strings.Contains(tr, "⟦") || strings.Contains(tr, "pi-chat cd8996c5") {
+		t.Fatalf("a turn marker reached the model-facing transcript: %q", tr)
+	}
+	if !strings.Contains(tr, "The bridge is restarting") {
+		t.Errorf("stripping the marker must not delete the notice a person is quoting: %q", tr)
+	}
+	if !strings.Contains(tr, "(id 42 is not a marker)") {
+		t.Errorf("human prose was rewritten: %q", tr)
+	}
+}

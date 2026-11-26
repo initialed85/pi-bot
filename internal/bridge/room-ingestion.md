@@ -370,3 +370,32 @@ with the pinned digest. The gateway half (`gateway/index.ts`, the `endedAt` mark
 *pi session*, which loads pi-bot from `/root/.pi/agent/git/github.com/initialed85/pi-bot`, so it needs a
 package checkout update plus a Pi reload - and a reload drops the in-memory turn records, so it is done
 when the room is quiet, never mid-answer.
+
+## 2026-11-26T08:44Z: the turn marker, and why it is `⟦pi-chat …⟧`
+
+Ed pointed at a posted notice - "The bridge is restarting while that was running… (id cd8996c5)" - and
+asked the right question: anything the bridge prints into a room comes back through the conversation
+window on the next message, and a model repeats what it can see. So the id needed a form that is
+unmistakable to the bridge and untypeable by a person.
+
+The marker is now `⟦pi-chat cd8996c5⟧` and it goes at the **start** of a notice. ⟦ (U+27E6) and ⟧
+(U+27E7) render fine in Chat, appear in no prose, and are matched by exactly one regex in
+`internal/chatid`, which is the only package that knows the format:
+
+- `Mark(turnID, text)` - what the bridge posts, including the `✏️ (corrected)` message.
+- `Strip(text)` - removes markers. Applied in `chatevents.writeLine`, which is where the window lines are
+  rendered, so neither the classifier transcript nor Pi's prompt can ever contain one. The notice text
+  itself stays: a person quoting "that bridge-restarting one" needs the words, not the token.
+- `Refs(text)` - the ids a message points at, read BEFORE stripping.
+
+"Honoured" means the bridge resolves those ids rather than forwarding them. `Bridge.turnReferenceNote`
+looks each fragment up in the turn journal - owed records, then a 32-deep ring of recently answered ones -
+and tells Pi what that turn was asked and by whom, so "what happened to that one?" has an answer. A
+fragment older than the journal is stated as unknown instead of left as a mystery string.
+
+Matching is deliberately narrow: only lowercase `pi-chat` inside the brackets is a marker, only 4-40 hex
+characters. A hand-typed `⟦PI-CHAT ABCDEF01⟧` is a person's words and is left alone, because a strip rule
+that deletes typed text is worse than one that misses a lookalike. The gateway keeps a second strip in
+`cleanTurnTokens` for prompts that arrive with a marker still in them, and records the fragments on the
+turn (`refs`) so `/status` can show which earlier turn a message was about - resolution stays bridge-side
+because that is where the journal is.

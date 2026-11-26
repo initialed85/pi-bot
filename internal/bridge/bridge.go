@@ -25,6 +25,7 @@ import (
 
 	"github.com/initialed85/pi-bot/internal/chatapi"
 	"github.com/initialed85/pi-bot/internal/chatgate"
+	"github.com/initialed85/pi-bot/internal/chatid"
 	"github.com/initialed85/pi-bot/internal/chatmsg"
 	"github.com/initialed85/pi-bot/internal/gateway"
 )
@@ -815,6 +816,12 @@ func (b *Bridge) onMessage(ctx context.Context, ev *chatmsg.Event) error {
 		}
 	}
 	prompt := ev.Prompt()
+	// A marker the bridge wrote is machine text, never something to reason about. People quote notices back
+	// at us ("⟦pi-chat cd8996c5⟧ what happened to that one?"), and the useful part of that is the turn it
+	// names, so the ids are read out first and the token is then gone from everything downstream: the
+	// classifier, Pi, and the log of what was judged.
+	refs := chatid.Refs(prompt)
+	prompt = chatid.Strip(prompt)
 	// The gate judges what the human typed, and sees the room only through `Transcript` - the exact shape
 	// eval/chat-gate/eval-context.mjs measured. Handing it the scaffolded prompt below would show the
 	// window twice: the same verdict for double the tokens, and a "Message" that is not anyone's message.
@@ -826,6 +833,9 @@ func (b *Bridge) onMessage(ctx context.Context, ev *chatmsg.Event) error {
 	if ev.Conversation != "" && !ev.DM {
 		prompt = "Conversation in this room so far, oldest first, read from Google Chat just now. " +
 			"The new message to act on is quoted after it.\n" + ev.Conversation + "\nNew message: " + prompt
+	}
+	if note := b.turnReferenceNote(refs); note != "" {
+		prompt = prompt + "\n" + note
 	}
 	if suppress {
 		return nil
@@ -1279,7 +1289,7 @@ func (b *Bridge) Recover(ctx context.Context) {
 		turn, err := b.gw.Turn(ctx, w.turnID)
 		switch {
 		case errors.Is(err, gateway.ErrUnknownTurn):
-			b.setStatus(w, w.bubble, "⚠️ I lost that question when the bridge restarted, and Pi has no record of it either. Send it again."+idSuffix(w.turnID))
+			b.setStatus(w, w.bubble, chatid.Mark(w.turnID, "⚠️ I lost that question when the bridge restarted, and Pi has no record of it either. Send it again."))
 			b.journal.drop(w.promptID)
 			b.log.Warn("owed turn has no gateway record", "turn", w.turnID, "space", w.space, "asked", p.Asked)
 		case err != nil:
@@ -1361,16 +1371,16 @@ func (b *Bridge) watch(base context.Context, w *watch, start time.Time) {
 			// leaving a bubble that says "working" forever - it is the last thing we can tell that user -
 			// but keep the turn owed, because the answer may still exist and the next process can deliver it.
 			if posted == "" {
-				b.setStatus(w, bubble, "⚠️ The bridge is restarting while that was running. I will post the answer when it lands, if I still have it."+idSuffix(w.turnID))
+				b.setStatus(w, bubble, chatid.Mark(w.turnID, "⚠️ The bridge is restarting while that was running. I will post the answer when it lands, if I still have it."))
 			}
 			return
 		case <-poll.Done():
 			if base.Err() == nil && posted == "" {
 				if !started {
-					b.setStatus(w, bubble, fmt.Sprintf("⌛️ Pi has not started on that in %s - it is queued behind other work. Send it again, or send /stop to clear the queue.%s", humanDuration(b.cfg.MaxWait*queuePatience), idSuffix(w.turnID)))
+					b.setStatus(w, bubble, chatid.Mark(w.turnID, fmt.Sprintf("⌛️ Pi has not started on that in %s - it is queued behind other work. Send it again, or send /stop to clear the queue.", humanDuration(b.cfg.MaxWait*queuePatience))))
 					b.log.Warn("queued turn never started", "turn", w.turnID, "waited", humanDuration(b.cfg.MaxWait*queuePatience))
 				} else {
-					b.setStatus(w, bubble, fmt.Sprintf("⌛️ Stopped watching after %s. Pi may still be running - send /status to check, or /stop to abort it.%s", humanDuration(b.cfg.MaxWait*queuePatience), idSuffix(w.turnID)))
+					b.setStatus(w, bubble, chatid.Mark(w.turnID, fmt.Sprintf("⌛️ Stopped watching after %s. Pi may still be running - send /status to check, or /stop to abort it.", humanDuration(b.cfg.MaxWait*queuePatience))))
 					b.log.Warn("stopped watching after the patience ceiling", "turn", w.turnID, "after", humanDuration(time.Since(start)), "queued", humanDuration(w.queued))
 				}
 			}
@@ -1380,7 +1390,7 @@ func (b *Bridge) watch(base context.Context, w *watch, start time.Time) {
 
 		turn, err := b.gw.Turn(poll, w.turnID)
 		if errors.Is(err, gateway.ErrUnknownTurn) {
-			b.setStatus(w, bubble, "⚠️ Pi has no record of that turn - the session probably restarted while it was running. Try again."+idSuffix(w.turnID))
+			b.setStatus(w, bubble, chatid.Mark(w.turnID, "⚠️ Pi has no record of that turn - the session probably restarted while it was running. Try again."))
 			b.journal.drop(w.promptID)
 			return
 		}
@@ -1388,7 +1398,7 @@ func (b *Bridge) watch(base context.Context, w *watch, start time.Time) {
 			failures++
 			b.log.Warn("poll failed", "turn", w.turnID, "err", err, "failures", failures)
 			if failures == 5 {
-				b.setStatus(w, bubble, "⚠️ Lost contact with Pi. It may still be working; check the terminal."+idSuffix(w.turnID))
+				b.setStatus(w, bubble, chatid.Mark(w.turnID, "⚠️ Lost contact with Pi. It may still be working; check the terminal."))
 			}
 			if failures > 30 {
 				return
@@ -1434,7 +1444,7 @@ func (b *Bridge) watch(base context.Context, w *watch, start time.Time) {
 
 		if started && time.Now().After(deadline) {
 			if posted == "" {
-				b.setStatus(w, bubble, fmt.Sprintf("⌛️ Still working, but I stopped watching after %s. Pi may still be running - send /status to check, or /stop to abort it.%s", b.cfg.MaxWait, idSuffix(w.turnID)))
+				b.setStatus(w, bubble, chatid.Mark(w.turnID, fmt.Sprintf("⌛️ Still working, but I stopped watching after %s. Pi may still be running - send /status to check, or /stop to abort it.", b.cfg.MaxWait)))
 				b.log.Warn("turn outlived the watching deadline", "turn", w.turnID, "after", humanDuration(time.Since(start)), "queued", humanDuration(w.queued))
 			}
 			return
@@ -1597,7 +1607,11 @@ func (b *Bridge) correctAnswer(w *watch, delivered, latest string) {
 		} else {
 			chunk = fmt.Sprintf("*(corrected, continued %d/%d)*", i+1, len(chunks)) + "\n\n" + chunk
 		}
-		if _, err := b.chat.Post(ctx, chunk, chatapi.PostOpts{
+		text := chunk
+		if i == 0 {
+			text = chatid.Mark(w.turnID, text)
+		}
+		if _, err := b.chat.Post(ctx, text, chatapi.PostOpts{
 			Space:    w.space,
 			Thread:   w.thread,
 			ClientID: clientID(fmt.Sprintf("correct-%s-%d", w.turnID, i)),
@@ -1606,6 +1620,30 @@ func (b *Bridge) correctAnswer(w *watch, delivered, latest string) {
 			return
 		}
 	}
+}
+
+// turnReferenceNote explains to Pi which earlier turn a quoted notice belongs to. The marker alone is
+// useless to a model - it cannot look up its own log - so the bridge resolves it against the turns it
+// knows and says what that turn was asked, which is the difference between "what happened to that one?"
+// getting an answer and getting a shrug.
+func (b *Bridge) turnReferenceNote(refs []string) string {
+	if len(refs) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		if p := b.journal.recall(ref); p != nil {
+			b.log.Info("message points at a bridge notice", "ref", ref, "turn", p.TurnID, "asked", p.Asked, "user", p.User)
+			lines = append(lines, fmt.Sprintf(
+				"The sender quoted a pi-chat notice from an earlier turn. That turn asked: %q (from %s). If they are asking what happened to it, answer about that question.",
+				p.Asked, firstNonEmptyStr(p.User, "the room")))
+			continue
+		}
+		b.log.Info("message points at a turn id the bridge has no record of", "ref", ref)
+		lines = append(lines, fmt.Sprintf(
+			"The sender quoted a pi-chat notice tagged %s, which this bridge has no record of (it is older than the turn journal).", ref))
+	}
+	return strings.Join(lines, "\n")
 }
 
 // Stop aborts whatever Pi is running. One Pi session per bridge, so this is deliberately global.
@@ -1782,20 +1820,6 @@ func clientID(key string) string {
 }
 
 // shortID is the turn id: deterministic from the Chat message so a redelivery maps to the same turn.
-// idSuffix tags every notice the bridge posts with the turn it is talking about. Notices are the messages
-// most likely to be followed by "what happened to that one?", and the id is what turns that into a log
-// lookup instead of a guess.
-func idSuffix(turnID string) string {
-	id := strings.TrimSpace(turnID)
-	if id == "" {
-		return ""
-	}
-	if len(id) > 8 {
-		id = id[:8]
-	}
-	return " (id " + id + ")"
-}
-
 func shortID(messageName string) string {
 	if messageName == "" {
 		return fmt.Sprintf("%d", time.Now().UnixNano())

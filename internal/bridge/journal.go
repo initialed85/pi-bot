@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -53,7 +54,15 @@ type journal struct {
 
 	mu    sync.Mutex
 	turns map[string]*pendingTurn
+	// answered is a small in-memory ring of turns that have been delivered, newest last. It exists only
+	// so a person quoting a notice back at us resolves to the question that notice was about; the file
+	// does not carry it, because that answer is already in Chat.
+	answered []*pendingTurn
 }
+
+// maxAnsweredRing bounds the recall ring. Anything older is a conversation the bridge should re-read
+// rather than reconstruct.
+const maxAnsweredRing = 32
 
 // maxJournalTurns bounds the file. Past it the oldest owed records are dropped, because a bridge that
 // cannot deliver is better off saying nothing than recovering a backlog of stale answers.
@@ -147,7 +156,13 @@ func (j *journal) drop(promptID string) {
 		return
 	}
 	j.mu.Lock()
-	_, existed := j.turns[promptID]
+	p, existed := j.turns[promptID]
+	if existed {
+		j.answered = append(j.answered, p)
+		if len(j.answered) > maxAnsweredRing {
+			j.answered = j.answered[len(j.answered)-maxAnsweredRing:]
+		}
+	}
 	delete(j.turns, promptID)
 	list := make([]*pendingTurn, 0, len(j.turns))
 	for _, v := range j.turns {
@@ -171,6 +186,29 @@ func (j *journal) pending() []*pendingTurn {
 	}
 	sort.Slice(list, func(i, int2 int) bool { return list[i].Start.Before(list[int2].Start) })
 	return list
+}
+
+// recall resolves a turn-id fragment - the part inside a ⟦pi-chat …⟧ marker - to the turn it names,
+// owing records first and then recently answered ones.
+func (j *journal) recall(ref string) *pendingTurn {
+	if j == nil || ref == "" {
+		return nil
+	}
+	ref = strings.ToLower(ref)
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	for _, p := range j.turns {
+		if strings.HasPrefix(strings.ToLower(p.TurnID), ref) {
+			return p
+		}
+	}
+	for i := len(j.answered) - 1; i >= 0; i-- {
+		p := j.answered[i]
+		if strings.HasPrefix(strings.ToLower(p.TurnID), ref) {
+			return p
+		}
+	}
+	return nil
 }
 
 func (j *journal) write(list []*pendingTurn) {

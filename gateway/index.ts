@@ -81,6 +81,8 @@ interface Turn {
   answer?: string;
   /** Set when the final message was rejected as leaked tool-call markup, for the trail. */
   answerRejected?: string;
+  /** Turn-id fragments this message quoted from a bridge notice, newest run first. */
+  refs?: string[];
   turns: number;
   createdAt: number;
   startedAt?: number;
@@ -100,6 +102,15 @@ interface Turn {
 
 /** `[pi-chat:<id>]` marker the bridge puts in every prompt so a user message can be traced back. */
 const MARKER = /\[pi-chat:([A-Za-z0-9_-]{3,40})\]/g;
+
+/**
+ * `⟦pi-chat <hex>⟧` - the marker the bridge puts at the front of every notice it posts (see
+ * internal/chatid). It never occurs in typed prose, which is what makes removing it from message text
+ * safe. The bridge strips it and resolves it against its turn journal before Pi ever sees it; this is
+ * the second line of defence, and it keeps the reference on the turn record so /status can say which
+ * earlier turn a person was asking about.
+ */
+const TURN_TOKEN = /\u27e6pi-chat ([0-9a-fA-F]{4,40})\u27e7/g;
 
 /** Per-message reminder of the bridge's forwarding rule, appended after the user's text. */
 const CHAT_RULE = "[chat bridge: only your final text block is posted back to Chat - intermediates are dropped. End with a self-contained answer.]";
@@ -257,6 +268,7 @@ export default function activate(pi: ExtensionAPI) {
       const message: any = event.message;
       if (message?.role !== "user") return;
       const raw = textOf(message);
+      const refs = [...raw.matchAll(TURN_TOKEN)].map((m) => m[1].toLowerCase());
       const ids = idsOf(raw);
       if (ids.length === 0) return;
       // The marker tells us which Chat message this prompt is. The POST /v1/prompt handler has
@@ -279,7 +291,7 @@ export default function activate(pi: ExtensionAPI) {
         note(queuedTurn);
         return;
       }
-      const input: TurnInput = { id: ids[0], text: raw.replace(MARKER, "").trim(), source: "chat", at: Date.now() };
+      const input: TurnInput = { id: ids[0], text: cleanTurnTokens(raw.replace(MARKER, "")).trim(), source: "chat", at: Date.now() };
       const target = active && !ctx.isIdle() ? active : undefined;
       if (target) {
         target.inputs.push(input);
@@ -291,6 +303,9 @@ export default function activate(pi: ExtensionAPI) {
         active = turn;
       }
       const owner = active!;
+      if (refs.length) {
+        owner.refs = Array.from(new Set([...(owner.refs ?? []), ...refs]));
+      }
       for (const id of ids) {
         turns.set(id, owner);
         if (!order.includes(id)) order.push(id);
@@ -453,6 +468,7 @@ export default function activate(pi: ExtensionAPI) {
       createdAt: turn.createdAt,
       startedAt: turn.startedAt,
       endedAt: turn.endedAt,
+      refs: turn.refs,
       settledAt: turn.settledAt,
       turns: turn.turns,
       model: turn.model,
@@ -676,5 +692,10 @@ export default function activate(pi: ExtensionAPI) {
 }
 
 function cleanPrompt(text: string): string {
-  return text.replace(MARKER, "").replace(/\s+/g, " ").trim().slice(0, 80);
+  return cleanTurnTokens(text.replace(MARKER, "")).replace(/\s+/g, " ").trim().slice(0, 80);
+}
+
+/** Removes every bridge turn marker from text, leaving whatever a person wrote around it intact. */
+function cleanTurnTokens(text: string): string {
+  return text.replace(TURN_TOKEN, "").replace(/[ \t]{2,}/g, " ");
 }

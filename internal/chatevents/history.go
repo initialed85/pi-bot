@@ -42,6 +42,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/initialed85/pi-bot/internal/chatid"
 )
 
 const (
@@ -117,7 +119,9 @@ func writeLine(b *strings.Builder, m Message) {
 		who += " (bot)"
 	}
 	when := m.CreateTime.UTC().Format("15:04")
-	text := strings.Join(strings.Fields(m.Text), " ")
+	// A bridge notice in the window is machine text. Stripping its marker here is what keeps the token out
+	// of both the classifier transcript and Pi's prompt, without touching anything a person typed.
+	text := chatid.Strip(strings.Join(strings.Fields(m.Text), " "))
 	if len(text) > 200 {
 		text = text[:200] + "…"
 	}
