@@ -131,12 +131,40 @@ func TestReplyGateWritesItsEvidenceOnTheWayThrough(t *testing.T) {
 	if len(got) == 0 {
 		t.Fatal("an answered message left no recorded decision")
 	}
-	last := got[len(got)-1]
+	// A turn-lifecycle row and a gate row now share this file, so each is found by its own shape rather
+	// than by position in it.
+	var judged, watched []gateDecision
+	for _, d := range got {
+		if d.Kind == "turn" {
+			watched = append(watched, d)
+			continue
+		}
+		judged = append(judged, d)
+	}
+	if len(judged) == 0 {
+		t.Fatalf("the gate made a judgement and recorded nothing: %+v", got)
+	}
+	last := judged[len(judged)-1]
 	if last.Flow != chatgate.FlowThreadRequest || last.Action != "thread" || last.Mode != "enforce" {
 		t.Fatalf("recorded decision = %+v", last)
 	}
 	if last.PromptID == "" {
 		t.Errorf("a decision with no prompt id cannot be tied back to the message: %+v", last)
+	}
+	if len(watched) == 0 {
+		t.Fatalf("the bridge watched a turn and recorded nothing about the wait: %+v", got)
+	}
+	watchedRow := watched[len(watched)-1]
+	if watchedRow.PromptID == "" {
+		t.Errorf("a turn row with no prompt id cannot be tied to the message it served: %+v", watchedRow)
+	}
+	switch watchedRow.Action {
+	case "answered", "outlived", "dropped", "merged", "failed", "started":
+	default:
+		t.Errorf("unrecognised turn outcome recorded: %+v", watchedRow)
+	}
+	if watchedRow.Action == "answered" && watchedRow.RunMS <= watchedRow.QueuedMS {
+		t.Errorf("an answered turn must show time spent running: %+v", watchedRow)
 	}
 }
 

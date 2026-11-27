@@ -1478,6 +1478,7 @@ func (b *Bridge) watch(base context.Context, w *watch, start time.Time) {
 			// arrive with nobody left to post it.
 			deadline = time.Now().Add(b.cfg.MaxWait)
 			b.log.Info("agent started the turn", "turn", w.turnID, "waited", humanDuration(w.queued))
+			b.recordTurn(w, "started", w.queued, 0)
 		}
 
 		if turn.Settled() {
@@ -1506,6 +1507,7 @@ func (b *Bridge) watch(base context.Context, w *watch, start time.Time) {
 			if posted == "" {
 				b.setStatus(w, bubble, chatid.Mark(w.turnID, fmt.Sprintf("⌛️ Still working, but I stopped watching after %s. Pi may still be running - send /status to check, or /stop to abort it.", b.cfg.MaxWait)))
 				b.log.Warn("turn outlived the watching deadline", "turn", w.turnID, "after", humanDuration(time.Since(start)), "queued", humanDuration(w.queued))
+				b.recordTurn(w, "outlived", w.queued, time.Since(start))
 			}
 			return
 		}
@@ -1572,6 +1574,24 @@ func (b *Bridge) showThinking(w *watch, bubble string, already bool) bool {
 
 // finish delivers the outcome of a settled turn. A failure stays visible as text in the bubble; a
 // success retires the bubble so the thread is left holding only the answer.
+// recordTurn appends one turn-lifecycle line to the gate's decision file. The reason it exists is that
+// "feels slow" has two causes and only one of them is the model: a Chat message can wait minutes for the
+// session to start on it, and then be answered quickly. Only the bridge sees both halves - it dispatches
+// the prompt and it watches for the answer - and stdout dies with the pod, so the split has to land on
+// the volume.
+func (b *Bridge) recordTurn(w *watch, action string, queued, run time.Duration) {
+	b.journal.recordDecision(gateDecision{
+		Kind:     "turn",
+		Flow:     "turn",
+		Action:   action,
+		PromptID: w.promptID,
+		Space:    w.space,
+		Thread:   w.thread,
+		QueuedMS: queued.Milliseconds(),
+		RunMS:    run.Milliseconds(),
+	})
+}
+
 func (b *Bridge) finish(w *watch, bubble string, turn gateway.Turn, elapsed time.Duration) {
 	text := finalText(turn)
 	// Delivered, or deliberately given up on: either way this turn is no longer owed.
@@ -1583,6 +1603,7 @@ func (b *Bridge) finish(w *watch, bubble string, turn gateway.Turn, elapsed time
 	if turn.ID != w.promptID && !turn.HasInput(w.promptID) {
 		b.setStatus(w, bubble, "⚠️ Pi finished a run without picking your message up. Send it again.")
 		b.log.Warn("settled turn does not carry our prompt", "prompt", w.promptID, "turn", turn.ID, "status", turn.Status)
+		b.recordTurn(w, "dropped", w.queued, elapsed)
 		return
 	}
 
@@ -1592,6 +1613,7 @@ func (b *Bridge) finish(w *watch, bubble string, turn gateway.Turn, elapsed time
 	if !b.claimTurn(turn.ID) {
 		b.setStatus(w, bubble, "👍")
 		b.log.Info("answer already posted by the turn this prompt joined", "prompt", w.promptID, "turn", turn.ID)
+		b.recordTurn(w, "merged", w.queued, elapsed)
 		return
 	}
 
@@ -1599,6 +1621,7 @@ func (b *Bridge) finish(w *watch, bubble string, turn gateway.Turn, elapsed time
 	case "aborted", "error":
 		b.setStatus(w, bubble, text)
 		b.log.Info("turn failed", "turn", w.turnID, "status", turn.Status, "err", firstNonEmptyStr(turn.Error, ""), "after", humanDuration(elapsed))
+		b.recordTurn(w, "failed", w.queued, elapsed)
 		return
 	}
 
@@ -1614,6 +1637,7 @@ func (b *Bridge) finish(w *watch, bubble string, turn gateway.Turn, elapsed time
 	}
 	b.log.Info("replied", "turn", w.turnID, "status", turn.Status, "chars", len(text),
 		"after", humanDuration(elapsed), "queued", humanDuration(w.queued), "worked", humanDuration(elapsed-w.queued))
+	b.recordTurn(w, "answered", w.queued, elapsed)
 }
 
 // deliverAnswer writes the model's text into the thread. Chunking is forced by Chat's 32,000 character

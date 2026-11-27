@@ -41,6 +41,18 @@ type gateDecision struct {
 	ContextChars int       `json:"context_chars"`
 	LatencyMS    int64     `json:"latency_ms"`
 	ThreadHasBot bool      `json:"thread_has_bot,omitempty"`
+
+	// Kind separates a turn-lifecycle record from a reply-gate judgement. Gate rows leave it empty, so
+	// every reader written before 2026-11-27 keeps working unchanged; a reviewer filters on kind=="turn".
+	//
+	// These rows exist because "feels slow" has two causes and only one of them is the model. Pi-ed's
+	// 2026-11-27 read of 50 settled turns measured queueing (a prompt waiting for a session to start on
+	// it) as the real term and first-token latency as microseconds, but that evidence lives in the gateway
+	// and dies with the pod. queued_ms and run_ms here are the same split from the bridge, which is the
+	// only place that sees both: it dispatches the prompt and it watches for the answer.
+	Kind     string `json:"kind,omitempty"`
+	QueuedMS int64  `json:"queued_ms,omitempty"`
+	RunMS    int64  `json:"run_ms,omitempty"`
 }
 
 // recordDecision appends one line. Best-effort on purpose: this is evidence, and a full or read-only
