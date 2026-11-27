@@ -5,8 +5,9 @@
 // The media flow is the one documented in spike/FINDINGS.md, not the one the docs imply: the
 // downloadUri inside a Pub/Sub event is a Chat *web app* redirect that serves HTML to a non-browser
 // client, so the bytes come from the media API instead -
-// GET https://chat.googleapis.com/v1/media/{base64 attachmentDataRef.resourceName}?alt=media -
-// using the same chat.bot credential.
+// GET https://chat.googleapis.com/v1/media/{name}?alt=media - using the same chat.bot credential.
+// `name` is either the plain attachment resource name or the base64 reference from an event; see
+// DownloadMedia, which tries both because no live attachment existed to settle the question earlier.
 package chatapi
 
 import (
@@ -191,50 +192,131 @@ func (c *Client) AttachmentMetadata(ctx context.Context, name string) (*Attachme
 	return meta, nil
 }
 
-// DownloadMedia fetches attachment bytes. resourceName is the base64
-// `attachmentDataRef.resourceName` from the event, used verbatim in the URL - it is itself the
-// base64 of "spaces/…/messages/…/attachments/…".
-func (c *Client) DownloadMedia(ctx context.Context, resourceName string, maxBytes int64) ([]byte, string, error) {
-	name, err := ResolveResource(resourceName)
-	if err != nil {
-		return nil, "", err
+// DownloadMedia fetches attachment bytes.
+//
+// Two URL shapes appear in the Chat reference and in the spike notes, and until 2026-11-27 no live
+// attachment had ever arrived to settle which one the media endpoint actually serves: the plain
+// resource name, or the base64 reference used verbatim in the path. Both are tried, plain name first
+// because that is the form ResolveResource can prove it decodes to, and both failures are reported
+// together if neither works.
+func (c *Client) DownloadMedia(ctx context.Context, ref string, maxBytes int64) ([]byte, string, error) {
+	targets, problem := mediaTargets(ref)
+	if len(targets) == 0 {
+		return nil, "", problem
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, mediaPath+name+"?alt=media", nil)
+	var problems []string
+	if problem != nil {
+		problems = append(problems, problem.Error())
+	}
+	for _, target := range targets {
+		data, ctype, err := c.fetchMedia(ctx, target, maxBytes)
+		if err == nil {
+			return data, ctype, nil
+		}
+		problems = append(problems, err.Error())
+	}
+	return nil, "", fmt.Errorf("chatapi: download media: %s", strings.Join(problems, "; "))
+}
+
+// mediaTargets lists the path suffixes to try, most-provable first, without repeating any.
+func mediaTargets(ref string) ([]string, error) {
+	var out []string
+	var problem error
+	name, err := ResolveResource(ref)
+	if err != nil {
+		problem = err
+	} else {
+		out = append(out, name)
+	}
+	if ref != "" && !strings.HasPrefix(ref, "spaces/") && ref != name {
+		if _, err := base64.StdEncoding.DecodeString(ref); err == nil {
+			out = append(out, ref)
+		}
+	}
+	return out, problem
+}
+
+func (c *Client) fetchMedia(ctx context.Context, target string, maxBytes int64) ([]byte, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, mediaPath+target+"?alt=media", nil)
 	if err != nil {
 		return nil, "", err
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("chatapi: download media: %w", err)
+		return nil, "", fmt.Errorf("%s: request: %w", truncForErr(target), err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, "", fmt.Errorf("chatapi: download media: HTTP %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, "", fmt.Errorf("%s: HTTP %d %s", truncForErr(target), resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
 	if err != nil {
-		return nil, "", fmt.Errorf("chatapi: read media: %w", err)
+		return nil, "", fmt.Errorf("read media: %w", err)
 	}
 	if int64(len(data)) > maxBytes {
-		return nil, "", fmt.Errorf("chatapi: attachment exceeds %d byte limit", maxBytes)
+		return nil, "", fmt.Errorf("attachment exceeds %d byte limit", maxBytes)
 	}
 	return data, resp.Header.Get("content-type"), nil
 }
 
-// ResolveResource accepts either the base64 reference from an event or a plain resource name.
+// ResolveResource turns an attachment reference into the resource name the media endpoint wants.
+//
+// The base64 is not the bare name. On a live image message (2026-11-27T03:12:56Z,
+// spaces/m4d90aAAAAE/messages/tBiu9mGNP0M) the decoded 94 bytes are 0x0a (protobuf field 1, wire
+// type 2), 0x5c (a length of 92 covering the rest), then "spaces/…/attachments/…". Passing that
+// straight into http.NewRequestWithContext produced
+//
+//	parse "https://chat.googleapis.com/v1/media/\n\\spaces/…": net/url: invalid control character in URL
+//
+// and the attachment was replaced in the prompt by a sentence about failing to read it. So the
+// framing is stripped here, and any name that still carries a control character is refused rather
+// than pasted into a URL: a refusal is one lost attachment, a mangled URL is one lost attachment
+// plus a message that looks like a bug in the file.
 func ResolveResource(ref string) (string, error) {
 	if ref == "" {
 		return "", fmt.Errorf("chatapi: empty attachment reference")
 	}
 	if strings.HasPrefix(ref, "spaces/") {
-		return ref, nil
+		return cleanResource(ref)
 	}
 	raw, err := base64.StdEncoding.DecodeString(ref)
 	if err != nil {
 		return "", fmt.Errorf("chatapi: decode attachment ref: %w", err)
 	}
-	return string(raw), nil
+	s := string(raw)
+	if len(s) >= 2 && s[0] == 0x0a && s[1] == byte(len(s)-2) {
+		s = s[2:]
+	}
+	if i := strings.Index(s, "spaces/"); i > 0 {
+		s = s[i:]
+	}
+	return cleanResource(s)
+}
+
+// cleanResource keeps a resource name that is safe to place in a URL path and refuses anything else.
+func cleanResource(s string) (string, error) {
+	if i := strings.IndexFunc(s, func(r rune) bool { return r < 0x20 || r == 0x7f }); i >= 0 {
+		return "", fmt.Errorf("chatapi: attachment reference has a control character at byte %d, refusing to build a URL from it", i)
+	}
+	if !strings.HasPrefix(s, "spaces/") {
+		return "", fmt.Errorf("chatapi: attachment reference %q does not name a Chat resource", truncForErr(s))
+	}
+	return s, nil
+}
+
+// truncForErr keeps a diagnostic short without slicing a rune in half.
+func truncForErr(s string) string {
+	const keep = 48
+	if len(s) <= keep {
+		return s
+	}
+	for i := keep; i > 0; i-- {
+		if s[i]&0xC0 != 0x80 {
+			return s[:i] + "…"
+		}
+	}
+	return s[:keep] + "…"
 }
 
 func replyOption(thread string) string {
