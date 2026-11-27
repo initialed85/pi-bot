@@ -81,6 +81,16 @@ func New(endpoint, model string, timeout time.Duration) *Client {
 		endpoint = DefaultEndpoint
 	}
 	endpoint = strings.TrimRight(endpoint, "/")
+	// Callers paste OpenAI-compatible base URLs, which conventionally end in /v1.
+	// classify() appends /v1/chat/completions itself, so a trailing /v1 here asks
+	// for /v1/v1/chat/completions and the server answers 404. Measured live on
+	// 2026-11-27T02:01Z when the in-cluster base was set that way: the warm-up
+	// failed after 3 attempts and every reply-gate decision fell back, blind.
+	endpoint = strings.TrimSuffix(endpoint, "/v1")
+	endpoint = strings.TrimRight(endpoint, "/")
+	if endpoint == "" {
+		endpoint = DefaultEndpoint
+	}
 	if strings.TrimSpace(model) == "" {
 		model = DefaultModel
 	}

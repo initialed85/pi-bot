@@ -229,3 +229,36 @@ func TestPromptPutsTheTranscriptAboveTheInstruction(t *testing.T) {
 		t.Fatal("empty transcript still composed a header")
 	}
 }
+
+func TestNewNormalizesOpenAIBaseSuffix(t *testing.T) {
+	const host = "http://sentiment-analyzer.sentiment-analyzer.svc.cluster.local:9999"
+	for _, in := range []string{host + "/v1", host + "/v1/", host} {
+		if got := New(in, "m", time.Second).endpoint; got != host {
+			t.Errorf("New(%q).endpoint = %q, want %q", in, got, host)
+		}
+	}
+	if got := New("/v1", "m", time.Second).endpoint; got != DefaultEndpoint {
+		t.Errorf("degenerate base collapsed to %q, want the shipped default", got)
+	}
+	if got := New("http://host.example/v1/api", "m", time.Second).endpoint; got != "http://host.example/v1/api" {
+		t.Errorf("a /v1 that is not the last segment must survive, got %q", got)
+	}
+}
+
+func TestClassifyPathIsSingleV1(t *testing.T) {
+	var seen string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.URL.Path
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":" NO "}}]}`))
+	}))
+	defer server.Close()
+
+	answer, prompt, _, err := New(server.URL+"/v1", "test-model", time.Second).Classify(context.Background(), Request{Flow: FlowShouldRespond, Summary: "a topic", Sender: "Ed", Message: "what's up"})
+	if err != nil || answer != "NO" || prompt == "" {
+		t.Fatalf("answer=%q prompt=%q err=%v", answer, prompt, err)
+	}
+	if seen != "/v1/chat/completions" {
+		t.Errorf("request path = %q, want /v1/chat/completions", seen)
+	}
+}

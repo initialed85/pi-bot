@@ -93,9 +93,15 @@ default** because the classifier is a dev-only dependency that can be slow while
 explicitly to call the OpenAI-compatible classifier, log one structured `reply gate` decision per
 gated message, and preserve the existing Chat behaviour. It never gates `@pi-chat` messages.
 
+`PI_CHAT_REPLY_GATE_URL` is a **base** URL: the client posts to `<base>/v1/chat/completions`,
+so give it a host and port without `/v1`. A pasted OpenAI-style `.../v1` is stripped (see
+`New()`), because leaving it in makes the gate 404 and fail open on every message. In-cluster
+`<svc>.<ns>.svc.cluster.local:9999` is about 5-10x cheaper than the Traefik hostname on the
+same model: median 286 ms through the proxy against 53-117 ms measured direct.
+
 ```bash
 PI_CHAT_REPLY_GATE_MODE=dry-run       # off | dry-run | enforce (application default: off)
-PI_CHAT_REPLY_GATE_URL=https://sentiment-analyzer.dev.initialed85.cc
+PI_CHAT_REPLY_GATE_URL=http://sentiment-analyzer.sentiment-analyzer.svc.cluster.local:9999
 PI_CHAT_REPLY_GATE_MODEL=unsloth/gemma-4-E4B-it-GGUF:IQ4_XS
 PI_CHAT_REPLY_GATE_TIMEOUT_SECONDS=3            # deadline for the first attempt
 PI_CHAT_REPLY_GATE_ATTEMPT_MS=3000,6000,12000   # every attempt; unset means double the previous one
