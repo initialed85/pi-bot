@@ -189,9 +189,9 @@ type wireMessage struct {
 	ArgumentText string          `json:"argumentText"`
 	Annotations  []wireAnnotation
 	Attachment   []wireAttachment `json:"attachment"`
-	SlashCommand json.RawMessage `json:"slashCommand"`
-	Silent       bool            `json:"silent"`
-	CreateTime   string          `json:"createTime"`
+	SlashCommand json.RawMessage  `json:"slashCommand"`
+	Silent       bool             `json:"silent"`
+	CreateTime   string           `json:"createTime"`
 }
 
 type wireThread struct {

@@ -128,10 +128,10 @@ type State struct {
 	ThinkingLevel string `json:"thinkingLevel"`
 	ActiveTurn    string `json:"activeTurn"`
 	// Compacting reports a context rewrite in flight; the gateway holds Chat prompts until it lands.
-	Compacting  bool `json:"compacting"`
-	Turns         int    `json:"turns"`
-	Commands      int    `json:"commands"`
-	ContextUsage  struct {
+	Compacting   bool `json:"compacting"`
+	Turns        int  `json:"turns"`
+	Commands     int  `json:"commands"`
+	ContextUsage struct {
 		Tokens        int     `json:"tokens"`
 		ContextWindow int     `json:"contextWindow"`
 		Percent       float64 `json:"percent"`
