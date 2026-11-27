@@ -3,8 +3,32 @@
 #
 # The privileged docker step needs this repo marked trusted in the Woodpecker UI (security trust), and it
 # reaches the daemon of one CI node so the layer cache survives between runs.
+#
+# Why the gate is duplicated here instead of trusted to ./ci.yaml (the same contract as camry and rooter):
+# two files in .woodpecker/ are two independent pipelines with no ordering between them, because `depends_on`
+# does not cross files, and on 2026-11-27 rooter read the step logs of pi-bot pipelines 40 and 41 to prove what
+# that costs: `build-and-push` published and tagged the image in 38 s while `test-bridge` failed in the same
+# second, so two commits that never passed their own gate (`56b6b7a079`, `9119556d62`, both gofmt) existed as
+# pushed images. A publish gate re-runs the checks rather than racing them. The duplication is the price of
+# ordering; the alternative is a red pipeline that tells you nothing about what shipped.
 steps:
+  # The gate. Same checks as ./ci.yaml so the two lanes cannot disagree about what they accept.
+  - name: test-bridge
+    image: docker.io/library/golang:1.27-alpine
+    commands:
+      - go version
+      - test -z "$(gofmt -l .)" || { echo "FATAL the files above are unformatted; run gofmt -w ."; exit 1; }
+      - go vet ./...
+      - go test -count=1 ./...
+
+  - name: check-gateway
+    image: docker.io/library/node:22-alpine
+    commands:
+      - node --version
+      - npm run check
+
   - name: build-and-push
+    depends_on: [test-bridge, check-gateway]
     image: docker.io/library/docker:cli
     privileged: true
     environment:
