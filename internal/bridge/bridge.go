@@ -840,7 +840,12 @@ func (b *Bridge) onMessage(ctx context.Context, ev *chatmsg.Event) error {
 		return nil
 	}
 	if ev.Prompt() == "" && len(ev.Attachments) == 0 {
-		b.reply(ctx, ev, "I got an empty message.")
+		// Silence, not a reply. A message that says nothing usually says nothing on purpose: a deleted
+		// post, a stamp, someone's finger on the send key. And since a room-listener photo arrives here too
+		// - the field mask carries no attachment data, so a photograph looks exactly like this - answering
+		// it produced "I got an empty message." in reply to a picture of a spider, which tells the room
+		// that we cannot see and spends a turn to say so.
+		b.log.Info("empty message; nothing to do", "space", ev.Space, "thread", ev.Thread, "message", ev.MessageName)
 		return nil
 	}
 

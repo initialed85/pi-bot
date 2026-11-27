@@ -1954,3 +1954,30 @@ func TestMentionPromptCarriesTheConversationWindow(t *testing.T) {
 		t.Fatalf("the message itself is missing from the prompt: %q", prompts[0].Text)
 	}
 }
+
+// An empty message is silence, not a sentence about emptiness. Two reasons, and the second is why this
+// test exists: a room photo takes exactly this path today, because the workspace field mask names no
+// attachment field and so a picture arrives with neither text nor attachments. It used to answer
+// "I got an empty message." to a photograph - which told the room we cannot see, and cost a turn.
+func TestEmptyMessageIsSilent(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		ev   *chatmsg.Event
+	}{
+		{"dm", gateEvent(true, false)},
+		{"room", roomRootEvent()},
+	} {
+		b, chat, gw := newTestBridge(t)
+		ev := test.ev
+		ev.Text, ev.Argument = "", ""
+		if err := b.onMessage(context.Background(), ev); err != nil {
+			t.Fatalf("%s: onMessage: %v", test.name, err)
+		}
+		if got := len(chat.allPosts()); got != 0 {
+			t.Fatalf("%s: posts = %d, want silence: %#v", test.name, got, chat.allPosts())
+		}
+		if got := gw.promptCount(); got != 0 {
+			t.Fatalf("%s: prompts = %d, want Pi never woken", test.name, got)
+		}
+	}
+}
