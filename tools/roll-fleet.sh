@@ -11,11 +11,24 @@
 set -u
 
 NS=slopyphus
-OLD_FULL=$(git ls-remote https://github.com/initialed85/pi-ed refs/tags/roll-2026-11-27 2>/dev/null | awk '{print $1}')
-OLD=$(echo "$OLD_FULL" | cut -c1-7)
 REPORT=/workspace/pi-bot/.pi/roll-report.txt
 LOG=/workspace/pi-bot/.pi/roll.log
 PIN=f3df9788   # the commit the fleet is on now; the roll only starts when the tag is past it
+
+# ROLL_NOW=1 ROLL_FROM=<short sha the pods are actually running> skips the wait loop. Needed when
+# the owner moved the tag BEFORE this script started (2026-11-28: pi-ed moved roll-2026-11-27 to
+# 2d00c68 while the fleet sat on 009d3cb), because without it the script captures the live tag as
+# OLD and then waits for a second move that will never come, aborting with no pod restarted.
+# ROLL_FROM is the last-known fleet commit, so NEW != OLD holds and the roll proceeds.
+
+# Peel the tag (`refs/tags/X^{}`). A pod checks out the COMMIT, so comparing against the annotated
+# tag OBJECT sha labels every correctly-rolled pod a mismatch - which is exactly what the 04:47Z
+# run reported: 15 pods at 2d00c68, all "MISMATCH ... want 8659dbb", where 8659dbb is the tag object
+# and 2d00c68 the commit it points at. The roll was fine; the check was not.
+REMOTE_TAG='refs/tags/roll-2026-11-27^{}'
+OLD_FULL=$(git ls-remote https://github.com/initialed85/pi-ed "$REMOTE_TAG" 2>/dev/null | awk '{print $1}')
+OLD=$(echo "$OLD_FULL" | cut -c1-7)
+if [ "${ROLL_NOW:-0}" = 1 ] && [ -n "${ROLL_FROM:-}" ]; then OLD=$ROLL_FROM; OLD_FULL="$ROLL_FROM (ROLL_FROM)"; fi
 
 log() { echo "$(date -u +%H:%M:%SZ) $*" | tee -a "$LOG"; }
 
@@ -24,7 +37,7 @@ log "roll-watch start; tag roll-2026-11-27 = $OLD, waiting for it to move off $P
 
 i=0
 while [ "$i" -lt 60 ]; do
-    NEW_FULL=$(git ls-remote https://github.com/initialed85/pi-ed refs/tags/roll-2026-11-27 2>/dev/null | awk '{print $1}')
+    NEW_FULL=$(git ls-remote https://github.com/initialed85/pi-ed "$REMOTE_TAG" 2>/dev/null | awk '{print $1}')
     NEW=$(echo "$NEW_FULL" | cut -c1-7)
     if [ -n "$NEW" ] && [ "$NEW" != "$OLD" ]; then
         log "tag moved: $OLD -> $NEW ($NEW_FULL)"
@@ -34,7 +47,7 @@ while [ "$i" -lt 60 ]; do
     sleep 45
 done
 
-NEW_FULL=$(git ls-remote https://github.com/initialed85/pi-ed refs/tags/roll-2026-11-27 2>/dev/null | awk '{print $1}')
+NEW_FULL=$(git ls-remote https://github.com/initialed85/pi-ed "$REMOTE_TAG" 2>/dev/null | awk '{print $1}')
 NEW=$(echo "$NEW_FULL" | cut -c1-7)
 if [ -z "$NEW" ] || [ "$NEW" = "$OLD" ]; then
     log "ABORT: the tag never moved within 45 minutes; no pod was restarted"
@@ -77,6 +90,6 @@ for d in $DEPLOYS; do
     sleep 15
 done
 
-log "done: $ok pods verified on $EXPECT_SHORT ($EXPECT_FULL, tag object $NEW), $bad problems. pi-bot not rolled yet (deliberate, it is last)."
+log "done: $ok pods verified on $NEW ($NEW_FULL), $bad problems. pi-bot not rolled yet (deliberate, it is last)."
 echo "target_commit $NEW_FULL" >> "$REPORT"
 echo "pi-bot deferred, deliberate" >> "$REPORT"
