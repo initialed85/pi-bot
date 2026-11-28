@@ -21,6 +21,8 @@
 //	PI_CHAT_DELIVER_AS         followUp | steer (default followUp: a message sent while Pi is working
 //	                           queues behind the run and gets its own answer; steer folds it into the
 //	                           run that is going)
+//	PI_CHAT_BURST_SECONDS      how soon after the message that opened a run a plain message counts as the
+//	                           same thought and steers it instead of queueing (default 60; 0 disables)
 //	PI_CHAT_STATUS_MODE        patch | bubble | none (default patch: one message carries 👀 -> 🤔 ->
 //	                           the answer; bubble posts the answer separately and deletes the status
 //	                           message; none posts no status at all)
@@ -522,6 +524,10 @@ func loadSettings() (settings, error) {
 	s.cfg.Eyes = envDefault("PI_CHAT_EYES", s.cfg.Eyes)
 	s.cfg.Thinking = envDefault("PI_CHAT_THINKING", s.cfg.Thinking)
 	s.cfg.PollInterval = seconds("PI_CHAT_POLL_SECONDS", s.cfg.PollInterval)
+	// Quick-fire messages from one person are one thought arriving in pieces. Inside this window a follow-up
+	// steers the run the previous message opened, so a typo and its correction get a single answer instead of
+	// two - and outside it a later, unrelated message still waits its turn rather than bending the run.
+	s.cfg.BurstWindow = seconds("PI_CHAT_BURST_SECONDS", s.cfg.BurstWindow)
 
 	s.cfg.MaxWait = minutes("PI_CHAT_MAX_WAIT_MINUTES", s.cfg.MaxWait)
 	// A rollout used to abandon every running turn after 20 seconds, which put "the bridge stopped" in

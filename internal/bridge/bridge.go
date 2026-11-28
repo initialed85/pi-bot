@@ -132,6 +132,14 @@ type Config struct {
 	// people expect from a chat; "steer" folds it into the run in progress so the work bends to it.
 	// /steer and /queue choose for themselves and ignore this.
 	DeliverAs string
+	// BurstWindow is how soon after the message that OPENED a running turn a plain message counts as the
+	// same thought rather than a new one. People type in bursts: a message sent by accident, then the
+	// correct one seconds later, and queueing the second behind the first means answering the typo and then
+	// answering the correction. Inside the window the follow-up steers the run that is already going, so the
+	// burst gets one answer that reflects the last thing the person meant. Outside it, the default stands -
+	// an unrelated message four minutes into a long run must not bend that run off its task. 0 disables the
+	// rule and keeps every plain message on cfg.DeliverAs.
+	BurstWindow time.Duration
 	// Eyes is the glyph posted the instant the bridge accepts a message. Set it to "none" to disable
 	// the status bubble entirely; leaving it unset means "use the default", which keeps this field
 	// workable from an environment where an empty value is indistinguishable from an absent one.
@@ -226,6 +234,7 @@ func DefaultConfig() Config {
 		PollInterval:          2 * time.Second,
 		StatusMode:            "patch",
 		DeliverAs:             "followUp",
+		BurstWindow:           time.Minute,
 		Eyes:                  "\U0001f440",
 		Thinking:              "\U0001f914",
 		MaxWait:               30 * time.Minute,
@@ -271,6 +280,11 @@ func (c Config) withDefaults() Config {
 	default:
 		d.DeliverAs = DefaultConfig().DeliverAs
 	}
+	// BurstWindow is copied rather than defaulted, because its zero value is meaningful: 0 turns the
+	// quick-fire rule off and every plain message follows DeliverAs. The 60s default lives in
+	// DefaultConfig(), which is what the process starts from before PI_CHAT_BURST_SECONDS can set it back
+	// to zero on purpose.
+	d.BurstWindow = c.BurstWindow
 	if c.Eyes != "" {
 		d.Eyes = glyphOrNone(c.Eyes)
 	}
@@ -413,6 +427,9 @@ type watch struct {
 	promptID string
 	turnID   string
 	space    string
+	// opened is when the bridge handed this turn's prompt to Pi. The burst rule measures a follow-up
+	// against it, and a recovered watch leaves it zero, which conservatively means "not a burst".
+	opened   time.Time
 	thread   string
 	replyID  string // deterministic client- id, so a redelivery cannot fork a second reply
 	statusID string // likewise for the status bubble, so a redelivery reuses the one already up
@@ -903,14 +920,19 @@ func (b *Bridge) onMessage(ctx context.Context, ev *chatmsg.Event) error {
 	}
 
 	turnID := shortID(ev.MessageName)
+	deliverAs, foldedInto := b.deliverAsFor(ev.Space)
 	req := gateway.PromptRequest{
 		ID:        turnID,
 		Text:      prompt,
 		Images:    images,
-		DeliverAs: b.cfg.DeliverAs,
+		DeliverAs: deliverAs,
 		User:      fmt.Sprintf("%s <%s>", ev.Who(), ev.UserEmail),
 		Space:     ev.Space,
 		ReplyTo:   ev.MessageName,
+	}
+	if foldedInto != "" {
+		b.log.Info("folding a quick follow-up into the run that opened it",
+			"prompt", turnID, "run", foldedInto, "window", b.cfg.BurstWindow.String())
 	}
 	resp, err := b.gw.Prompt(ctx, req)
 	if err != nil {
@@ -923,6 +945,27 @@ func (b *Bridge) onMessage(ctx context.Context, ev *chatmsg.Event) error {
 	}
 	b.trackThread(ctx, turnID, canonicalTurn(resp, turnID), ev, replyThread)
 	return nil
+}
+
+// deliverAsFor picks the delivery mode for a plain message. It answers "steer" only when a run for this
+// space is already going AND the message that opened it is recent enough to be the same thought; the age
+// of the run is not the test, because a long-running task is exactly when a four-minute-later message is
+// unrelated. Returns the mode and, when it chose to steer, the turn it is folding into, so the caller can
+// log a decision nobody can reconstruct afterwards.
+func (b *Bridge) deliverAsFor(space string) (string, string) {
+	if b.cfg.DeliverAs == "steer" || b.cfg.BurstWindow <= 0 {
+		return b.cfg.DeliverAs, ""
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	w, ok := b.watches[space]
+	if !ok || w.opened.IsZero() {
+		return b.cfg.DeliverAs, ""
+	}
+	if time.Since(w.opened) > b.cfg.BurstWindow {
+		return b.cfg.DeliverAs, ""
+	}
+	return "steer", w.turnID
 }
 
 // replyGate decides whether an untagged message should reach Pi and which Chat thread should receive
@@ -1259,6 +1302,7 @@ func (b *Bridge) trackThread(base context.Context, promptID, turnID string, ev *
 		thread:   replyThread,
 		replyID:  clientID("reply-" + promptID),
 		statusID: clientID("status-" + promptID),
+		opened:   time.Now(),
 	}
 	b.mu.Lock()
 	b.watches[ev.Space] = w

@@ -91,7 +91,7 @@ func (b *Bridge) helpText() string {
 	lines := []string{
 		"*pi-chat* - a Pi session you can talk to from Chat.",
 		"",
-		"Send text (with `@pi-chat` in a room) and it goes to Pi. 👀 means the bridge has your message, 🤔 means Pi is working, and the only message left behind is the answer.",
+		"Send text (with `@pi-chat` in a room) and it goes to Pi. The only message left behind is the answer - there is no acknowledgement glyph.",
 		"",
 		"**Bridge commands**",
 		"`/help` this list",
@@ -101,7 +101,7 @@ func (b *Bridge) helpText() string {
 		"`/queue <text>` add a follow-up for when it finishes",
 		"`/stop` abort the current run",
 		"",
-		"A plain message sent while Pi is working queues behind that run, so each message gets its own answer; `/steer` is how you interrupt it.",
+		"A plain message sent while Pi is working queues behind that run, so each message gets its own answer. One sent within a minute of the message that STARTED it folds into that run instead, so a typo and the correction after it get a single answer; `/steer` and `/queue` choose for one message at a time. `PI_CHAT_BURST_SECONDS` moves or disables that window.",
 		"",
 		"**Passed through to Pi**",
 		"`/new`, `/compact`, `/model <id>`, `/thinking <level>`, `/name <text>`, `/resume` and any skill command - whatever this session defines.",

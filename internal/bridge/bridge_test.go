@@ -1568,6 +1568,7 @@ func TestWithDefaultsCarriesEveryConfigField(t *testing.T) {
 		GateRoomRootMode:      "enforce",
 		StatusMode:            "patch",
 		DeliverAs:             "followUp",
+		BurstWindow:           45 * time.Second,
 		Eyes:                  "👀",
 		Thinking:              "🤔",
 		PollInterval:          10 * time.Millisecond,
@@ -1980,4 +1981,82 @@ func TestEmptyMessageIsSilent(t *testing.T) {
 			t.Fatalf("%s: prompts = %d, want Pi never woken", test.name, got)
 		}
 	}
+}
+
+// Quick-fire messages are one thought arriving in pieces: an accidental send, then the correct one seconds
+// later. Queueing the second behind the first answers the typo and then answers the correction, which is two
+// replies for one request. Inside the burst window the follow-up steers the run that is already going.
+func TestDeliverAsFor(t *testing.T) {
+	const space = "spaces/m4d90aAAAAE"
+	b, _, _ := newTestBridge(t)
+
+	// No run in flight: nothing to fold into.
+	b.cfg.BurstWindow = time.Minute
+	if got, fold := b.deliverAsFor(space); got != "followUp" || fold != "" {
+		t.Errorf("idle space = %q/%q, want followUp and no fold target", got, fold)
+	}
+	b.watches[space] = &watch{turnID: "turn-1", space: space, opened: time.Now()}
+	if got, fold := b.deliverAsFor(space); got != "steer" || fold != "turn-1" {
+		t.Errorf("follow-up 5s into a run = %q/%q, want steer into turn-1", got, fold)
+	}
+	b.watches[space] = &watch{turnID: "turn-2", space: space, opened: time.Now().Add(-5 * time.Minute)}
+	if got, fold := b.deliverAsFor(space); got != "followUp" || fold != "" {
+		t.Errorf("message 5 minutes into a run = %q/%q, want it to keep its own turn", got, fold)
+	}
+	// A watch recovered from the journal has no opened time, and folding into a run we cannot date is a
+	// guess about somebody's task.
+	b.watches[space] = &watch{turnID: "turn-3", space: space}
+	if got, _ := b.deliverAsFor(space); got != "followUp" {
+		t.Errorf("recovered watch = %q, want the conservative queue", got)
+	}
+	// The window is a knob, and off has to mean off.
+	b.watches[space] = &watch{turnID: "turn-4", space: space, opened: time.Now()}
+	b.cfg.BurstWindow = 0
+	if got, _ := b.deliverAsFor(space); got != "followUp" {
+		t.Errorf("burst window 0 = %q, want the rule disabled", got)
+	}
+	// A global steer default is already what the operator asked for; the rule must not rewrite it.
+	b.cfg.BurstWindow = time.Minute
+	b.cfg.DeliverAs = "steer"
+	b.watches[space] = &watch{turnID: "turn-5", space: space, opened: time.Now().Add(-9 * time.Minute)}
+	if got, fold := b.deliverAsFor(space); got != "steer" || fold != "" {
+		t.Errorf("cfg steer = %q/%q, want steer passed through unchanged", got, fold)
+	}
+}
+
+func TestHandle_QuickFollowUpSteersTheOpenRun(t *testing.T) {
+	b, _, gw := newTestBridge(t)
+	b.cfg.BurstWindow = time.Minute
+	fixture := fixtureBytes(t, "dm_message.json")
+
+	if err := b.Handle(context.Background(), "psm-1", withText(t, fixture, "let's just go without reacts")); err != nil {
+		t.Fatalf("first message: %v", err)
+	}
+	if err := b.Handle(context.Background(), "psm-2", withMessageName(t, withText(t, fixture, "sorry - no reacts at all"), "spaces/m4d90aAAAAE/messages/second")); err != nil {
+		t.Fatalf("follow-up: %v", err)
+	}
+	if len(gw.prompts) != 2 {
+		t.Fatalf("prompts = %d, want both messages sent", len(gw.prompts))
+	}
+	if gw.prompts[0].DeliverAs != "followUp" {
+		t.Errorf("first message = %q, want followUp: there is no run to fold into", gw.prompts[0].DeliverAs)
+	}
+	if gw.prompts[1].DeliverAs != "steer" {
+		t.Errorf("follow-up = %q, want steer into the run that opened moments ago", gw.prompts[1].DeliverAs)
+	}
+
+	// The same person, later: now it is a new request and keeps its own turn.
+	b.mu.Lock()
+	b.watches["spaces/m4d90aAAAAE"] = &watch{turnID: "turn-old", space: "spaces/m4d90aAAAAE", opened: time.Now().Add(-10 * time.Minute)}
+	b.mu.Unlock()
+	if err := b.Handle(context.Background(), "psm-3", withMessageName(t, withText(t, fixture, "what is on for dinner"), "spaces/m4d90aAAAAE/messages/third")); err != nil {
+		t.Fatalf("late message: %v", err)
+	}
+	if got := gw.prompts[2].DeliverAs; got != "followUp" {
+		t.Errorf("message 10 minutes into a run = %q, want followUp", got)
+	}
+	for _, p := range gw.prompts {
+		gw.settle(p.ID, "done")
+	}
+	b.Wait()
 }
